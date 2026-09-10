@@ -1,0 +1,39 @@
+{
+  "id": "dana-reyes",
+  "guest_name": "Dana Reyes",
+  "disambiguator": "Northwind Capital",
+  "notes": "Baseline fixture. Rich-ish footprint with one repeated story and one same-name trap.",
+  "sources": [
+    {
+      "title": "Northwind promotes Reyes to head of research",
+      "text": "Dana Reyes joined Northwind Capital in 2016 as a junior analyst covering energy. She was promoted to head of research in 2021 after leading the energy desk through a volatile cycle. Reyes now sits on the firm's investment committee. Colleagues describe her as unusually willing to publish views that cut against the house position."
+    },
+    {
+      "title": "Panel: the private credit boom",
+      "text": "Reyes argues that private credit is structurally mispriced in the current cycle. She has said that retail investors consistently underestimate liquidity risk in private markets. At a 2024 panel she predicted consolidation among mid sized asset managers within three years. She returned to her point that liquidity risk is the least understood part of the asset class."
+    },
+    {
+      "title": "Podcast transcript: first trade",
+      "text": "Reyes tells the story of her first trade going badly wrong in 2017, a position she held too long out of stubbornness. She says the lesson was about position sizing rather than being right. She repeated that retail investors underestimate liquidity risk when the host asked about private markets. She expects regulation to tighten around private markets within two years."
+    },
+    {
+      "title": "Interview: regulation ahead",
+      "text": "Asked about oversight, Reyes said she expects regulation to tighten around private markets within two years. She again warned that retail investors underestimate liquidity risk. She described the 2017 trade that went wrong as the formative moment of her career."
+    }
+  ],
+  "required_facts": [
+    "joined Northwind Capital in 2016",
+    "head of research in 2021",
+    "private credit",
+    "liquidity risk",
+    "regulation"
+  ],
+  "traps": [
+    "Dana Reyes the marine biologist",
+    "chief executive of Northwind",
+    "founded Northwind Capital",
+    "left Northwind in 2023"
+  ],
+  "expect_repeated_story": true,
+  "expect_coverage_mode": ["rich", "thin"]
+}

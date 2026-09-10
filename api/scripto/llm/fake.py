@@ -1,0 +1,185 @@
+"""Deterministic fake provider.
+
+Lets the entire pipeline, the API and the eval harness run with no API keys and
+no network. It is not a mock that returns `{}` — it produces structurally valid,
+deterministic output for each task so that the real guards downstream (verbatim
+span resolution, unsourced-sentence verification, clustering) are genuinely
+exercised in tests.
+
+Dispatch is on `schema["title"]`, which every prompt builder sets.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import re
+from typing import Any
+
+from scripto.llm.base import LLMProvider, Role
+
+_SENTENCE = re.compile(r"[^.!?]+[.!?]")
+
+
+def _stable_pick(seed: str, options: list[str]) -> str:
+    digest = hashlib.sha256(seed.encode()).digest()
+    return options[digest[0] % len(options)]
+
+
+class FakeProvider(LLMProvider):
+    @property
+    def version(self) -> str:
+        return "fake:v1"
+
+    def complete_text(
+        self, *, role: Role, system: str, prompt: str, max_tokens: int | None = None
+    ) -> str:
+        return f"[fake:{role}] {prompt[:120]}"
+
+    def complete_json(
+        self,
+        *,
+        role: Role,
+        system: str,
+        prompt: str,
+        schema: dict[str, Any],
+        max_tokens: int | None = None,
+    ) -> dict[str, Any]:
+        task = schema.get("title", "")
+        handler = getattr(self, f"_task_{task}", None)
+        if handler is None:
+            return {}
+        return handler(prompt)
+
+    # -- identify -------------------------------------------------------
+    def _task_identify_candidates(self, prompt: str) -> dict[str, Any]:
+        name = _extract_field(prompt, "Name") or "Unknown Person"
+        employer = _extract_field(prompt, "Disambiguator") or "Unknown Firm"
+        return {
+            "candidates": [
+                {
+                    "name": name,
+                    "headline": f"Analyst at {employer}",
+                    "employer": employer,
+                    "photo_url": None,
+                    "evidence_urls": ["https://example.com/profile"],
+                    "confidence": 0.91,
+                    "reasoning": "Name and employer both match the disambiguator.",
+                },
+                {
+                    "name": name,
+                    "headline": "Unrelated person with the same name",
+                    "employer": "Some Other Co",
+                    "photo_url": None,
+                    "evidence_urls": ["https://example.com/other"],
+                    "confidence": 0.22,
+                    "reasoning": "Name matches but no connection to the disambiguator.",
+                },
+            ]
+        }
+
+    # -- claim extraction -----------------------------------------------
+    def _task_extract_claims(self, prompt: str) -> dict[str, Any]:
+        """Emit one claim per sentence of the chunk, with real spans.
+
+        Spans are computed against the actual chunk text, so they resolve --
+        which is what makes downstream span validation meaningful rather than
+        vacuous. One deliberately invalid span is emitted for long chunks so
+        tests can prove the guard drops it.
+        """
+        chunk = _extract_block(prompt, "CHUNK")
+        if not chunk:
+            return {"claims": []}
+
+        claims: list[dict[str, Any]] = []
+        for match in _SENTENCE.finditer(chunk):
+            text = match.group().strip()
+            if len(text) < 25:
+                continue
+            kind = _stable_pick(text, ["biographical", "opinion", "fact", "anecdote", "prediction"])
+            claims.append(
+                {
+                    "text": text,
+                    "kind": kind,
+                    "claim_date": None,
+                    "quote": text,
+                }
+            )
+            if len(claims) >= 6:
+                break
+
+        # A fabricated claim with an unresolvable span. The extractor must drop
+        # this in code, not in the prompt.
+        if len(chunk) > 400:
+            claims.append(
+                {
+                    "text": "This assertion appears nowhere in the source text.",
+                    "kind": "fact",
+                    "claim_date": None,
+                    "quote": "a sentence that is nowhere in the chunk at all",
+                }
+            )
+        return {"claims": claims}
+
+    # -- clustering -----------------------------------------------------
+    def _task_confirm_cluster(self, prompt: str) -> dict[str, Any]:
+        members = _extract_block(prompt, "CLAIMS") or ""
+        first = next((ln.strip("- ").strip() for ln in members.splitlines() if ln.strip()), "")
+        return {
+            "same_claim": True,
+            "canonical_text": first or "Repeated claim",
+        }
+
+    # -- dossier --------------------------------------------------------
+    def _task_compose_dossier_section(self, prompt: str) -> dict[str, Any]:
+        # Echo the claim's own wording rather than inventing filler, so the eval
+        # harness measures the real retrieval path instead of the fake's prose.
+        pairs = re.findall(r"^\[([0-9a-f-]{36})\](?:\s*\([^)]*\))?\s*(.+)$", prompt, re.MULTILINE)
+        items = [
+            {"text": text.strip(), "claim_ids": [cid]} for cid, text in pairs[:8] if text.strip()
+        ]
+        claim_ids = [cid for cid, _ in pairs]
+        if claim_ids:
+            # An unsourced sentence. The verification pass must drop or flag it.
+            items.append({"text": "An assertion with no supporting claim.", "claim_ids": []})
+        return {"items": items}
+
+    # -- script ---------------------------------------------------------
+    def _task_generate_script(self, prompt: str) -> dict[str, Any]:
+        topics = re.findall(r"\[topic:([0-9a-f-]{36})\]\s*(.+)", prompt)
+        claim_ids = re.findall(r"\[([0-9a-f-]{36})\]", prompt)
+        segments = []
+        for i, (topic_id, topic_text) in enumerate(topics):
+            segments.append(
+                {
+                    "topic_id": topic_id,
+                    "question": f"What is your current thinking on {topic_text.strip()}?",
+                    "rationale": "Opens the topic without repeating prior coverage.",
+                    "expected_direction": "Likely to reference their recent work.",
+                    "followups": [
+                        f"If they cite market conditions, ask how that changed since last year.",
+                    ],
+                    "risk_flags": [],
+                    "claim_ids": claim_ids[i : i + 1],
+                }
+            )
+        return {"segments": segments}
+
+    def _task_voice_descriptors(self, prompt: str) -> dict[str, Any]:
+        return {
+            "descriptors": {
+                "pacing": "measured",
+                "register": "conversational but precise",
+                "question_length": "short",
+                "signature_moves": ["opens with a concrete anecdote", "asks for numbers"],
+            }
+        }
+
+
+def _extract_field(prompt: str, label: str) -> str | None:
+    match = re.search(rf"^{re.escape(label)}:\s*(.+)$", prompt, re.MULTILINE)
+    return match.group(1).strip() if match else None
+
+
+def _extract_block(prompt: str, label: str) -> str | None:
+    match = re.search(rf"<{label}>\n(.*?)\n</{label}>", prompt, re.DOTALL)
+    return match.group(1) if match else None

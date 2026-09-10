@@ -1,0 +1,1175 @@
+# Scripto — System Design
+
+Last updated: 2026-09-10. Status: v1 proof of concept.
+
+This describes the system as it actually is, including what is not working yet.
+It covers what each part does, why it was built that way, what was rejected,
+and what we learned by running it against real providers. Use it as the
+starting point for going deeper into any part of the design.
+
+---
+
+## Contents
+
+1. [What the system does](#1-what-the-system-does)
+2. [Architecture at a glance](#2-architecture-at-a-glance)
+3. [Technology choices and why](#3-technology-choices-and-why)
+4. [Data model](#4-data-model)
+5. [The pipeline, stage by stage](#5-the-pipeline-stage-by-stage)
+6. [The job system](#6-the-job-system)
+7. [External providers](#7-external-providers)
+8. [Rate limits and cost control](#8-rate-limits-and-cost-control)
+9. [The trust chain: how citations are guaranteed](#9-the-trust-chain-how-citations-are-guaranteed)
+10. [Coverage modes and the topic brief](#10-coverage-modes-and-the-topic-brief)
+11. [API](#11-api)
+12. [Frontend](#12-frontend)
+13. [Configuration reference](#13-configuration-reference)
+14. [Testing, provider checks and evals](#14-testing-provider-checks-and-evals)
+15. [Local development environment](#15-local-development-environment)
+16. [What real-provider testing taught us](#16-what-real-provider-testing-taught-us)
+17. [Known gaps and open problems](#17-known-gaps-and-open-problems)
+18. [Deferred work and the seams left for it](#18-deferred-work-and-the-seams-left-for-it)
+19. [Code map](#19-code-map)
+
+---
+
+## 1. What the system does
+
+A podcast host enters a guest's name plus one disambiguator (LinkedIn URL, firm,
+or X handle). Scripto:
+
+1. finds 2–5 candidate identities and makes the host pick the right one,
+2. discovers and reads public sources about that person (articles, interviews,
+   YouTube captions, pasted notes),
+3. extracts atomic claims from those sources, each pinned to an exact span of
+   source text,
+4. writes a **dossier** — career timeline, recent news, public positions, things
+   they have said repeatedly ("already covered"), unexplored angles,
+5. writes an interview **script** for the host's chosen topics and style,
+6. lets the host edit it and export a PDF.
+
+The product promise is that **every line links back to a source the host can
+open**. Most of the design exists to make that promise hold.
+
+Scope, from `build-spec-v1.md`: one episode, one guest, one script.
+Explicit non-goals for v1: no LinkedIn/Instagram scraping, no audio
+transcription (YouTube captions only), no team collaboration, no publishing, no
+topic ideation (the user supplies topics), no billing.
+
+---
+
+## 2. Architecture at a glance
+
+```mermaid
+flowchart LR
+  subgraph Client
+    B["Browser<br/>Next.js app"]
+  end
+  subgraph Server
+    A["FastAPI<br/>API process"]
+    W1["Worker 1"]
+    W2["Worker N"]
+  end
+  DB[("Postgres 16<br/>+ pgvector")]
+  BL[("Blob store<br/>local FS / S3")]
+  subgraph External
+    S["Search<br/>DuckDuckGo / Exa / Tavily"]
+    WEB["Web pages<br/>YouTube captions"]
+    L["LLM<br/>Gemini / Anthropic"]
+    E["Embeddings<br/>Gemini / Voyage"]
+  end
+  B -- "REST + JWT<br/>polls every 2s" --> A
+  A -- "read / write<br/>enqueue jobs" --> DB
+  W1 -- "dequeue<br/>SKIP LOCKED" --> DB
+  W2 --> DB
+  W1 --> BL
+  W1 --> S
+  W1 --> WEB
+  W1 --> L
+  W1 --> E
+  A -. "identify runs inline" .-> S
+  A -. "identify runs inline" .-> L
+```
+
+Properties that the rest of the design depends on:
+
+- **The API process does not run pipeline work.** It validates, writes rows and
+  enqueues jobs. The one exception is identity lookup, which runs inline because
+  the user cannot do anything until it returns.
+- **Workers are stateless.** Scaling out means adding worker processes. All
+  coordination happens in Postgres.
+- **Postgres is the only stateful service.** It holds relational data, vectors,
+  the job queue, advisory locks, rate-limit state and spend budgets.
+- **Every external call goes through one chokepoint**, `provider_slot()` in
+  `api/scripto/jobs/limits.py`, which enforces budget, pacing and concurrency.
+- **Raw payloads are stored before parsing**, so everything downstream can be
+  recomputed without the network.
+
+### One episode, end to end
+
+```mermaid
+sequenceDiagram
+  participant U as Browser
+  participant A as API
+  participant DB as Postgres
+  participant W as Worker(s)
+  participant X as Providers
+  U->>A: POST /episodes (name + disambiguator)
+  U->>A: POST /episodes/{id}/identify
+  A->>X: 2 searches + 1 LLM ranking call
+  A-->>U: 2-5 candidates
+  U->>A: POST /confirm-guest {candidate_index}
+  A->>DB: create frozen entity, enqueue discover
+  loop every 2 seconds
+    U->>A: GET /episodes/{id}
+    A-->>U: status, sources, job progress
+  end
+  W->>DB: dequeue discover
+  W->>X: ~7 search queries
+  W->>DB: attach sources, enqueue fetch_source per source + coverage_check
+  W->>X: fetch pages / captions
+  W->>DB: store blob, parse into chunks, enqueue embed + extract_claims
+  W->>X: 1 LLM call per chunk
+  W->>DB: claims, enqueue cluster_claims
+  W->>DB: coverage_check scores, enqueues build_dossier
+  W->>X: 1 LLM call per dossier section
+  U->>A: GET /dossier
+  U->>A: POST /topics, POST /script
+  W->>X: voice descriptors (optional) + 1 script call
+  U->>A: GET /script, PATCH segment, GET /export?format=pdf
+```
+
+---
+
+## 3. Technology choices and why
+
+Each entry: what we chose, why, what we rejected, and when to revisit.
+
+### 3.1 Python 3.12, FastAPI, SQLAlchemy 2, Alembic
+
+- **Why.** Fixed by the spec, and a good fit anyway. Python has the strongest
+  libraries for the hard parts of this product: text extraction (`trafilatura`),
+  PDFs (`pypdf`), YouTube captions (`youtube-transcript-api`), tokenisers
+  (`tiktoken`) and first-party LLM SDKs. FastAPI gives typed request and response
+  models through Pydantic and generates OpenAPI docs at `/docs`. SQLAlchemy 2's
+  typed mappings keep models readable. Alembic manages migrations; there are 5 so
+  far.
+- **Python version.** The machine has 3.14, but several libraries lag behind, so
+  `uv` pins a 3.12 virtualenv.
+- **Revisit.** No reason to.
+
+### 3.2 Postgres 16 + pgvector as the only datastore
+
+- **Why.** The workload is bursty, long-running and IO-bound. It is not high
+  QPS. One database can carry relational data, vectors, the queue, locks,
+  rate-limit state and budgets. The spec rules out a separate vector database,
+  Redis and Kafka.
+- **Postgres features we rely on:**
+  - `SELECT … FOR UPDATE SKIP LOCKED` for the job queue (§6)
+  - session advisory locks for provider concurrency slots (§8.3)
+  - transaction advisory locks to serialise clustering per guest (§5.7)
+  - `INSERT … ON CONFLICT` for idempotency keys, budgets and pacing
+  - `clock_timestamp()` rather than `now()` for queue timing (§6.4)
+  - JSONB for flexible fields (candidates, coverage detail, follow-ups)
+- **Rejected.** Redis + Celery (another stateful service to run, and the spec
+  rules it out). A dedicated vector database (unnecessary below many thousands
+  of users).
+- **Honest note.** The `Vector(1024)` columns on `chunks` and `claims` store
+  embeddings, but nothing queries them through pgvector yet. There is no ANN
+  index, and clustering computes cosine similarity in Python. For now pgvector is
+  only storage.
+- **Revisit** when a single guest has thousands of claims. At that point, add an
+  HNSW index and move similarity search into SQL.
+
+### 3.3 A Postgres job queue instead of Celery
+
+Covered in §6. The short version: enqueueing in the same transaction as the data
+change means no lost or phantom jobs, no extra infrastructure, and the whole
+queue is inspectable with SQL.
+
+### 3.4 Client polling instead of websockets
+
+- **Why.** The spec calls for it. The API stays stateless, polling works through
+  any proxy, and pipeline progress only changes every few seconds anyway.
+- **Cost.** One request every 2 seconds per open episode tab, which is trivial at
+  this scale.
+
+### 3.5 Next.js App Router, TanStack Query, Tailwind
+
+- **TanStack Query** handles polling (its `refetchInterval` is a function of the
+  current data, so polling stops when work finishes), caching, and invalidation
+  after mutations.
+- **Tailwind** for speed. There is no component library.
+- Every page is a client component. The auth token lives in `localStorage`. That
+  is simple but exposed to XSS; move to httpOnly cookies before real users.
+
+### 3.6 Blob storage behind an interface
+
+- Raw payloads (HTML, PDF bytes, caption JSON, pasted text) are written to blob
+  storage **before** parsing, keyed by their sha256 checksum.
+- **Why.** Extraction will be re-run many times as prompts and models improve.
+  Refetching is slow and sometimes impossible (pages change or disappear). The
+  spec's acceptance criterion "reparsing requires no network fetches" depends on
+  this, and so does cross-user dedupe.
+- `LocalBlob` writes atomically (write a temp file, then rename). An `S3Blob`
+  implementation exists but has not been tested.
+
+### 3.7 The LLM provider abstraction
+
+- **Pipeline stages ask for a role, never a model.** The roles are `extract`,
+  `compose` and `rank`, and the provider maps each one to a model through
+  environment variables.
+- **Why roles.** The spec wants a cheap model for extraction and a strong one for
+  composition, and the volumes are very different: extraction makes one call per
+  chunk (dozens to hundreds per episode), while composition makes about six.
+- **Implementations:**
+  - `AnthropicProvider`: the official `anthropic` SDK, with structured output via
+    `output_config.format`. Written, but **never run against a live key**.
+  - `OpenAICompatibleProvider`: the `openai` SDK pointed at any compatible
+    endpoint. Used for Gemini through Google's OpenAI-compatible URL. Also works
+    for Groq, xAI and DeepSeek.
+  - `FakeProvider`: deterministic and schema-aware. It dispatches on the
+    schema's `title`, so tests and evals run with no keys.
+- **Every call returns JSON matching a schema.** On the OpenAI-compatible path,
+  the provider first tries strict `json_schema`, falls back to `json_object`, and
+  then runs `coerce_to_schema()`. That last step exists because Gemini under
+  `json_object` returned a bare array instead of `{"claims": [...]}`; when a
+  schema has exactly one array property, the bare array is wrapped into it.
+- **Reasoning effort is set per role** (`LLM_EXTRACT_REASONING_EFFORT`,
+  `LLM_COMPOSE_REASONING_EFFORT`). Extraction is mechanical: with thinking on,
+  `gemini-3.5-flash` took 46.6 s per call; with `reasoning_effort: none` it took
+  about 2 s. If an endpoint rejects the parameter with a 400, the call is retried
+  without it.
+- `max_tokens` defaults to 16000. Reasoning models spend tokens before they
+  write output, and a truncated response cannot be parsed.
+
+### 3.8 Why Gemini, for now
+
+- The user has a Gemini key, the free tier costs nothing, and the
+  OpenAI-compatible endpoint meant no new code.
+- **What testing against it showed (2026-09-10):**
+  - Pro models are not on the free tier: `gemini-pro-latest` and
+    `gemini-3.1-pro-preview` return 429.
+  - `gemini-3.5-flash` used up its daily quota during testing. Quotas are per
+    model.
+  - `gemini-3.8-flash` returned 503 "high demand" on every attempt.
+  - `gemini-2.5-flash` appears in the model list but returns 404. Listed does not
+    mean available, so `check_provider --models` should be run before trusting a
+    model id.
+  - The current choice is `gemini-3.1-flash-lite` for all three roles, at about
+    2 s per call.
+- Versions are pinned rather than using the `-latest` aliases, so that eval runs
+  stay comparable across changes.
+- **Revisit.** Extraction accuracy decides this (§9). If it stays around 80%, use
+  a stronger or paid model for `LLM_EXTRACT_MODEL` only.
+
+### 3.9 Why DuckDuckGo search, for now
+
+- It needs no key, no card and no signup (Tavily's free plan asked for a card).
+  It is implemented with the `ddgs` library.
+- **Tradeoff.** It is unofficial: it reads DuckDuckGo's public endpoints, is rate
+  limited, and can break whenever they change their markup. In the real test, 2
+  searches found 25 sources.
+- Exa and Tavily providers are written. Switching is one environment variable.
+
+### 3.10 Embeddings
+
+- Currently set to **`fake`**: a hashed bag-of-words. It is deterministic but
+  cannot match paraphrases, so clustering is not meaningful yet.
+- Gemini (`batchEmbedContents`) and Voyage are implemented. The Gemini provider
+  requests `outputDimensionality=1024` and renormalises, so its vectors fit the
+  schema's `Vector(1024)` columns with no migration.
+
+### 3.11 Auth
+
+- Email and password, one workspace per user. The spec asked for something
+  boring.
+- Passwords are hashed as **bcrypt over base64(sha256(password))**. bcrypt
+  silently truncates input at 72 bytes, so pre-hashing to a fixed 44 bytes means
+  long passwords keep their full strength. `passlib` was dropped because it is
+  unmaintained and breaks with bcrypt ≥ 4.
+- Tokens are JWT (HS256) with a 14-day expiry and the secret from `JWT_SECRET`.
+- **Revisit** before real users: refresh tokens, httpOnly cookies, and rate
+  limiting on login.
+
+### 3.12 Tooling
+
+`uv` for Python environments (fast, and it manages the interpreter version). npm
+for the web app (pnpm is not installed). pytest for tests. Ruff configuration is
+present.
+
+---
+
+## 4. Data model
+
+```mermaid
+erDiagram
+  USERS ||--o{ EPISODES : owns
+  ENTITIES ||--o{ EPISODES : "guest of"
+  EPISODES ||--o{ EPISODE_SOURCES : uses
+  SOURCES ||--o{ EPISODE_SOURCES : "attached via"
+  SOURCES ||--o{ CHUNKS : "split into"
+  CHUNKS ||--o{ CLAIMS : yields
+  ENTITIES ||--o{ CLAIMS : "subject of"
+  CLAIM_CLUSTERS ||--o{ CLAIMS : groups
+  EPISODES ||--o{ TOPICS : has
+  EPISODES ||--o{ DOSSIER_ITEMS : has
+  EPISODES ||--o{ SCRIPTS : has
+  SCRIPTS ||--o{ SCRIPT_SEGMENTS : contains
+  TOPICS ||--o{ SCRIPT_SEGMENTS : "covered by"
+  CHUNKS ||--o{ CITATIONS : "cited by"
+  EPISODES ||--o{ JOBS : drives
+```
+
+### The two decisions that carry the economics
+
+1. **Sources are global, not per episode.** They are unique on `canonical_url`
+   and on `checksum`, so two users researching the same guest never refetch or
+   reparse the same page. `episode_sources` is the join table. Removing a source
+   from an episode sets `removed_at` and never deletes the source.
+2. **Claims belong to the entity, not the episode.** A second episode with the
+   same guest reuses every claim already extracted, which is most of the cost.
+   Claims are unique on `(chunk_id, text_hash, extractor_version)`, so running
+   extraction with a new model version creates a new claim set instead of
+   overwriting the old one. `extractor_version` is
+   `provider:extract_model/compose_model`, which can be 60+ characters; that is
+   why the column is 255 wide (§16).
+
+### Tables
+
+| Table | Purpose | Notable details |
+|---|---|---|
+| `users` | Accounts | bcrypt-over-sha256 hash |
+| `entities` | A person, company or topic | Display fields (headline, employer, photo) are frozen at identification |
+| `episodes` | One research job | `status`: identifying → ingesting → dossier_ready → script_ready. `coverage_detail` JSONB also holds the identity candidates |
+| `sources` | One fetched document, shared globally | `status`: pending, fetched, parsed, failed. `error` is shown in the UI |
+| `episode_sources` | Links episodes to sources | `added_by` is system or user; `removed_at` is a soft remove |
+| `chunks` | A piece of a source, about 750 tokens | Exactly one position pair is set: character offsets for text, milliseconds for audio/video. A CHECK constraint enforces it |
+| `claims` | One atomic assertion about an entity | `kind`: biographical, opinion, fact, anecdote, prediction. `span_start`/`span_end` locate its quote inside the chunk |
+| `claim_clusters` | Groups of claims that say the same thing | `source_count` counts **distinct sources**, not claims |
+| `topics` | The host's 3–6 topics | |
+| `dossier_items` | One dossier line | Carries `claim_ids`. `cluster_id` is ON DELETE SET NULL |
+| `scripts` / `script_segments` | Script versions and their questions | Segments hold rationale, expected direction, follow-ups, risk flags and `edited_by_user` |
+| `citations` | Links a dossier item or segment to a chunk span | `target_type` is dossier_item or script_segment |
+| `jobs` | The work queue | §6 |
+| `usage_counters` | Per-user daily quotas | |
+| `provider_budgets` | Monthly call ceilings per provider | §8.1 |
+| `provider_pacing` | Next allowed call time per provider | §8.2 |
+
+### Where the model departs from the spec
+
+Added: `dossier_items` (the dossier needed to be stored somewhere, and citations
+point at it), `usage_counters`, `provider_budgets`, `provider_pacing`, and the
+`coverage_check` job kind. Claims gained `span_start`, `span_end`, `text_hash`
+and `embedding`. Jobs gained `idempotency_key`. Episodes gained
+`topic_entity_id`, `guest_name`, `disambiguator` and the coverage fields.
+
+### Migrations
+
+`api/scripto/migrations/versions/`, in order: initial schema (which also creates
+the `vector` extension), provider budgets, provider pacing, widen
+`extractor_version`, dossier cluster FK set null.
+
+---
+
+## 5. The pipeline, stage by stage
+
+```mermaid
+flowchart TD
+  CG["POST confirm-guest"] --> D["discover"]
+  D -->|"one per source"| F["fetch_source"]
+  UA["POST sources (URL)"] --> F
+  UP["POST sources (pasted text)"] --> PA
+  F --> PA["parse_source"]
+  PA --> EM["embed"]
+  PA --> EX["extract_claims"]
+  EX --> CL["cluster_claims"]
+  D --> CC["coverage_check"]
+  CC -->|"work still outstanding:<br/>re-enqueue in 10s"| CC
+  CC --> BD["build_dossier"]
+  CC -.->|"thin / sparse:<br/>topic discover (not wired, §10)"| D
+  SC["POST script"] --> GS["generate_script"]
+```
+
+| Stage | Triggered by | External calls | Idempotency key | If it fails |
+|---|---|---|---|---|
+| identify | `POST /identify`, inline | 2 searches, 1 LLM | none | 422 to the user |
+| discover | confirm-guest | ~7 searches | `discover:{episode}` | per-query errors are skipped |
+| fetch_source | discover or user URL | 1 fetch | `fetch:{source}` | source marked failed; the job itself succeeds |
+| parse_source | fetch or pasted text | none | `parse:{source}:{checksum}` | source marked failed |
+| embed | parse | batches of 64 | `embed:{source}:{checksum}` | retry, then dead |
+| extract_claims | parse | 1 LLM per chunk | `extract:{source}:{subject}:{checksum}` | retry, then dead |
+| cluster_claims | extract | embeddings + LLM confirmations | none (meant to re-run) | retry, then dead |
+| coverage_check | discover, source added, topics set | none | none | re-enqueues itself |
+| build_dossier | coverage_check | 1 LLM per section | `dossier:{episode}:{mode}:{claim_count}` | retries if 0 items were built from >0 claims |
+| generate_script | `POST /script` | 0–1 voice + 1 script | `script:{script}` | retry, then dead |
+
+### 5.1 Identify — `pipeline/identify.py`
+
+- Runs two searches, `"{name}" {disambiguator}` and `"{name}" profile bio`, with
+  8 results each, and dedupes the URLs.
+- One LLM call (role `rank`) returns up to 5 candidates with name, headline,
+  employer, evidence URLs, confidence and reasoning, sorted by confidence. They
+  are stored in `episode.coverage_detail.candidates`.
+- **The system never picks a candidate.** A wrong identity poisons everything
+  downstream, so the spec makes this step unskippable. `POST /confirm-guest`
+  creates the entity row, freezes it, sets the episode to `ingesting`, and
+  enqueues discover.
+- A name with no disambiguator is rejected at validation (422).
+- A registered `identify` job handler exists, but the route runs identification
+  inline because the user is waiting on it.
+
+### 5.2 Discover — `pipeline/discover.py`
+
+- Runs these query patterns, 6 results each:
+  `"{name}" {employer} news` · `"{name}" interview` · `"{name}" podcast` ·
+  `"{name}" site:youtube.com` · `"{name}" blog OR substack OR essay` ·
+  `"{name}" bio {employer}` · and, when an employer is known,
+  `"{name}" {employer} earnings call OR 10-K OR filing`.
+- Canonicalises and dedupes URLs, and stops at `MAX_SOURCES_PER_EPISODE`.
+- `attach_source()` reuses the global source row if one exists and only creates
+  new ones. It enqueues a fetch for each pending source, then enqueues
+  `coverage_check` with a 5 s delay.
+- **URL canonicalisation** (`adapters/base.py`) forces https, lowercases the
+  host, strips `www.` and default ports, drops tracking parameters (`utm_*`,
+  `fbclid`, `gclid`, `mc_*`, `ref_*`, `igshid`), strips the trailing slash and
+  drops the fragment. This function decides whether two users share a fetch.
+
+### 5.3 Fetch — `pipeline/fetch.py` and `adapters/`
+
+- If the blob already exists, fetch is skipped and the stage goes straight to
+  parsing, so retries are free.
+- The adapter's `fetch()` runs under `provider_slot("fetch")`. The payload's
+  sha256 becomes its checksum. If another source already has identical bytes and
+  is parsed, this source is marked failed as a duplicate. Otherwise the blob is
+  stored under its checksum, the status becomes `fetched`, and parse is
+  enqueued.
+- A `FetchError` marks the source failed with a readable error and **does not
+  fail the job**. A bad source degrades the dossier but never fails the run
+  (acceptance criterion).
+- **Adapters.** Each implements `fetch(url) -> bytes` and
+  `parse(bytes) -> ParsedSource`, and `parse` must not touch the network.
+  - `web_article`: `httpx`, then `trafilatura` with precision favoured and
+    metadata included.
+  - `youtube`: walks an ordered list of `TranscriptStrategy` objects. Captions is
+    on; Whisper is present but disabled (§18). The raw payload stored is the
+    transcript JSON, with millisecond segments.
+  - `pdf`: `pypdf`. Not yet tested against real PDFs.
+  - `user_pasted`: the blob is created at `POST` time and never fetched. This is
+    also how thin-footprint guests get a bio, CV or notes into the system.
+  - `profile`: the same as `web_article`.
+- `classify_url()` maps YouTube hosts to `youtube`, `.pdf` URLs to `pdf`,
+  LinkedIn/X/Twitter to `profile`, and everything else to `web_article`.
+
+### 5.4 Parse and chunk — `pipeline/fetch.py`, `pipeline/chunking.py`
+
+- Parses **only from the blob**. A test makes any `httpx.get` call raise during
+  reparse, which proves no network is used.
+- Deletes the source's existing chunks and re-chunks, so reparsing after an
+  extractor improvement leaves nothing stale.
+- **Text** is split on sentence boundaries and packed to about 750 tokens (the
+  `tiktoken` `cl100k_base` count) with about 100 tokens of overlap, carried over
+  as whole trailing sentences. A single sentence longer than the target becomes
+  its own chunk rather than being cut mid-sentence. Offsets resolve exactly
+  back to the source text, and a test checks this.
+- **Audio/video**: caption cues are far too small to use individually, so they
+  are packed up to the token target. The chunk's millisecond range covers the
+  whole group, and the speaker is set when every cue in the group has the same
+  one.
+- `cl100k_base` is OpenAI's tokenizer, so it only approximates Gemini and Claude
+  token counts. That is fine for sizing chunks.
+- Parse then enqueues `embed` and `extract_claims`.
+
+### 5.5 Embed — `pipeline/embed.py`
+
+- Embeds any chunks that lack an embedding, in batches of 64, under
+  `provider_slot("embedding")`.
+- **Nothing reads chunk embeddings yet.** Dossier retrieval selects claims by
+  kind, date and cluster, not by vector search. These embeddings are groundwork
+  for semantic retrieval later.
+
+### 5.6 Extract claims — `pipeline/extract.py`
+
+- One LLM call (role `extract`) per chunk, with the schema
+  `{claims: [{text, kind, claim_date, quote}]}`.
+- **The guard is enforced in code, not in the prompt.** `locate_quote()` looks
+  for the model's `quote` in the chunk: an exact match first, then a
+  whitespace-tolerant regex, with a minimum of 8 characters. If the quote cannot
+  be found, the claim is dropped. The claim's span is **the location of the
+  match**, so it is right by construction.
+- **Why quotes instead of offsets.** The first version asked the model for
+  `[start, end]` character offsets. On real output, 30% of those offsets pointed
+  at text unrelated to the claim: they were in bounds, so they passed the bounds
+  check, but they were wrong. Models copy text accurately and count characters
+  badly (§9).
+- A fallback path still accepts `verbatim_span` offsets for providers that
+  return them. It only checks bounds, so it is weaker.
+- Chunks already extracted at the current `extractor_version` are skipped.
+  Inserts use `ON CONFLICT DO NOTHING` on `(chunk_id, text_hash,
+  extractor_version)`.
+- If anything was produced, `cluster_claims` is enqueued with no idempotency key
+  and a 10 s delay.
+- **Gap.** "Only claims about the subject" is enforced only by the prompt. A
+  claim about Steve Ballmer inside a Nadella article could get through. Eval
+  traps are meant to catch this.
+
+### 5.7 Cluster claims — `pipeline/cluster.py`
+
+- Takes a **transaction-scoped advisory lock per subject** first. Clustering
+  rewrites every cluster row for that subject, and two concurrent runs
+  deadlocked against each other (§16). A waiting run simply goes next and sees
+  the newer claims.
+- Embeds any claims that lack a vector, then deletes and rebuilds all clusters
+  for the subject, since clusters are derived data.
+- Uses **greedy single-pass centroid clustering** at cosine ≥ 0.86. It is O(n·k)
+  in Python, which is fine for hundreds of claims and avoids a clustering
+  dependency.
+- Only groups that span **≥ 3 distinct sources** get an LLM confirmation call
+  (`same_claim`, `canonical_text`), because only those can reach "already
+  covered". Rejected groups are split into singletons. Every claim ends up in a
+  cluster.
+- **Gap.** This has never run with real embeddings, so "already covered", which
+  the spec calls the most valuable output, is unproven.
+
+### 5.8 Coverage check — `pipeline/coverage.py`
+
+- Waits until the episode has no queued or running `fetch_source`,
+  `parse_source`, `extract_claims` or `embed` jobs, re-enqueuing itself every
+  10 s until then.
+- Scores sources parsed, failed and total; claim count; cluster count; the date
+  span of claims; and whether a long-form appearance exists (a YouTube source,
+  or one source with ≥ 8000 characters of chunks).
+- Chooses a mode: **rich** needs ≥ 8 parsed sources, ≥ 15 clusters and a
+  long-form appearance; **thin** needs ≥ 3 parsed; anything less is **sparse**.
+  It also records a `missing[]` list of specific things to ask the user for.
+- For thin and sparse episodes it creates a topic entity and enqueues topic
+  discovery. That path is not wired yet; see §10.
+- Enqueues `build_dossier` with a key that includes the claim count, so new
+  claims always trigger a rebuild (§16).
+- **Gap.** `cluster_claims` is not on the wait list, so the dossier can be built
+  before clustering finishes.
+
+### 5.9 Build dossier — `pipeline/dossier.py`
+
+- Deletes the previous items and citations, then composes five guest sections.
+  Each section retrieves up to 60 claims, makes one compose call, and runs a
+  verification pass.
+
+| Section | Claims retrieved |
+|---|---|
+| career_timeline | `biographical`, oldest first |
+| recent_news | `claim_date` within the last 365 days, newest first |
+| public_positions | `opinion` and `prediction`, oldest first, so shifts over time show |
+| already_covered | claims in clusters with `source_count ≥ 3` |
+| unexplored_angles | `fact`, `opinion` and `anecdote`, least-covered clusters first |
+| topic_brief | the topic entity's claims (thin/sparse only; §10) |
+
+- **Verification.** An item survives only if at least one of its `claim_ids` is
+  in the set of claims actually given to the model. A made-up id counts the same
+  as no id, and the item is dropped. Citations are then created from each
+  claim's chunk and span.
+- If it builds **0 items while the subject has claims, it raises**, so the job
+  retries instead of reporting an empty page as success (§16).
+- `recent_news` depends on `claim_date`, which extraction often leaves empty.
+  The real run produced one item there.
+
+### 5.10 Generate script — `pipeline/script.py`
+
+- **Voice sample.** One call turns an uploaded transcript into style descriptors
+  (pacing, register, question length, signature moves). Only the descriptors go
+  into the script prompt, never the transcript itself, as the spec requires.
+- **Inputs:** topics (tagged `[topic:id]`), dossier lines (each with its first
+  claim id), the canonical text of already-covered clusters, and the style brief
+  for `formal`, `conversational`, `contrarian` or `educational`.
+- One compose call produces every segment. Each segment's `topic_id` is
+  validated, falling back to the topic at the same position, and its claim ids
+  are filtered down to real claims about the subject. Citations are created.
+  Regenerating replaces the segments.
+- **Gaps.** A segment with no valid claim id is **kept**, which contradicts the
+  spec's "every line in the script links to a source". Regenerating discards the
+  user's edits. Script quality has not been judged on real claims.
+
+### 5.11 Editing and export
+
+- `PATCH /scripts/{id}/segments/{sid}` updates fields and sets `edited_by_user`.
+- `GET /export?format=pdf` builds a PDF with `reportlab`: a limited-coverage
+  banner for thin and sparse episodes, dossier sections with up to 3 source
+  labels per item, and script segments with the question, its rationale,
+  follow-ups and flags. User text is escaped, because reportlab parses input as
+  mini-HTML.
+- Google Doc export is **not built**.
+
+---
+
+## 6. The job system
+
+`api/scripto/jobs/` — `queue.py`, `worker.py`, `registry.py`, `limits.py`.
+
+### 6.1 Why a Postgres queue
+
+- **Transactional enqueue.** A job is inserted in the same transaction as the data
+  change that caused it. If the transaction rolls back, the job never existed, so
+  there are no phantom jobs and no lost ones.
+- There is no extra service to run or monitor. The spec explicitly says no Redis
+  and no Celery.
+- The whole queue can be inspected with SQL. That is how every production bug in
+  §16 was diagnosed.
+
+### 6.2 Job lifecycle
+
+```mermaid
+stateDiagram-v2
+  [*] --> queued: enqueue
+  queued --> running: dequeue - attempts+1, lease 10 min
+  running --> done: handler returns
+  running --> queued: exception, attempts below 4 - backoff 2^n s, max 300
+  running --> dead: exception on 4th attempt
+  running --> dead: BudgetExceeded
+  running --> queued: SlotUnavailable - attempt refunded
+  running --> queued: lease expired - sweeper
+  done --> [*]
+  dead --> [*]
+```
+
+### 6.3 Fair dequeue
+
+```sql
+WITH running AS (
+  SELECT user_id, count(*) AS n FROM jobs WHERE state = 'running' GROUP BY user_id
+)
+SELECT j.id FROM jobs j
+LEFT JOIN running r ON r.user_id = j.user_id
+WHERE j.state = 'queued' AND j.next_attempt_at <= clock_timestamp()
+ORDER BY COALESCE(r.n, 0) ASC, j.created_at ASC
+FOR UPDATE OF j SKIP LOCKED
+LIMIT 1
+```
+
+Pure FIFO would let one user who starts a 25-source episode starve everyone else.
+Ordering by *that user's currently running job count* first means an idle user's
+job always goes ahead of a busy user's older one. A test covers this.
+
+### 6.4 The `clock_timestamp()` detail
+
+Postgres `now()` returns the **start of the current transaction**. With `now()`,
+a job enqueued and dequeued inside the same transaction was invisible forever,
+because its `next_attempt_at` was later than "now". Every queue time comparison
+uses `clock_timestamp()`, the actual wall clock.
+
+### 6.5 The worker process
+
+- Runs `WORKER_CONCURRENCY` threads (default 4). Each loop:
+  1. claims a job in its own short transaction and **commits**, so the lease
+     survives even if the handler crashes the process;
+  2. starts a heartbeat thread that extends the lease every `lease/3` (200 s);
+  3. runs the handler in a new transaction, then marks the job done.
+- A sweeper thread runs every `lease/2` (300 s) and requeues any job whose lease
+  has expired. That is how a crashed worker's jobs come back.
+- On SIGTERM it stops claiming work and lets in-flight jobs finish.
+- Exception handling: `BudgetExceeded` marks the job dead immediately.
+  `SlotUnavailable` requeues it and gives back the attempt, so a busy provider
+  never kills jobs. Anything else goes through the normal backoff.
+
+### 6.6 Idempotency keys
+
+| Key | Why it has that shape |
+|---|---|
+| `discover:{episode}` | Discover runs once per episode |
+| `fetch:{source}` | A source is fetched once, globally |
+| `parse:{source}:{checksum}` | Re-parses only when the content changes |
+| `embed:{source}:{checksum}` | Same |
+| `extract:{source}:{subject}:{checksum}` | Per subject, because claims belong to the entity |
+| `dossier:{episode}:{mode}:{claim_count}` | Must change when inputs change (§16) |
+| `script:{script}` | One generation per script version |
+| none on `coverage_check`, `cluster_claims` | Meant to re-run as new work lands |
+
+**Rule learned the hard way:** a key has to change whenever the job's inputs
+change. Otherwise the first run wins forever, even a run that happened before
+there was anything to process.
+
+### 6.7 Progress for the UI
+
+`episode_progress()` groups the episode's jobs by kind and state. "Pending" is
+the total minus done minus dead. This is what the progress bar shows.
+
+### 6.8 Known weaknesses
+
+- **Orchestration is implicit.** Stages trigger each other, and `coverage_check`
+  polls by re-enqueuing itself (8–11 of these per episode in the real run).
+  There is no explicit graph and no model of when a stage is complete. Several
+  of the ordering bugs in §16 came from this.
+- Two URLs whose content is identical, fetched before either is parsed, can both
+  try to set the same `checksum` and hit its unique constraint. This is an edge
+  case that has not been hit in practice.
+
+---
+
+## 7. External providers
+
+| Kind | Implementations | Chosen by | Tested live? |
+|---|---|---|---|
+| Search | `duckduckgo`, `exa`, `tavily`, `fake` | `SEARCH_PROVIDER` | DuckDuckGo: yes. Exa/Tavily: no |
+| LLM | `openai_compatible` (Gemini), `anthropic`, `fake` | `LLM_PROVIDER` | Gemini: yes. Anthropic: no |
+| Embeddings | `gemini`, `voyage`, `fake` | `EMBEDDING_PROVIDER` | None; fake is in use |
+| Web fetch | `httpx` + `trafilatura` | always | yes: 20 of 25 real pages parsed |
+| YouTube | `youtube-transcript-api` captions | always | yes: real captions with ms offsets |
+| PDF | `pypdf` | always | not against real PDFs |
+| Blob | `local`, `s3` | `BLOB_BACKEND` | local only |
+
+`python -m scripto.check_provider` smoke-tests whichever LLM is configured in
+about 3 calls: parseable JSON, whether quotes and spans resolve, schema and enum
+compliance, whether the composer cites claim ids, and identity ranking.
+`--models` lists what the endpoint actually serves.
+
+---
+
+## 8. Rate limits and cost control
+
+Every external call is wrapped in `with provider_slot(provider):`, which applies
+three layers in order:
+
+```mermaid
+flowchart LR
+  C["pipeline needs an<br/>external call"] --> B{"monthly budget<br/>left?"}
+  B -- no --> X["BudgetExceeded<br/>job marked dead"]
+  B -- "yes, count+1" --> P["pacing: wait for the<br/>next RPM slot"]
+  P --> S{"free concurrency<br/>slot within 30s?"}
+  S -- no --> R["SlotUnavailable<br/>requeued, attempt refunded"]
+  S -- yes --> M["make the call"]
+```
+
+### 8.1 Budget — a hard monthly ceiling
+
+- Stored in `provider_budgets(provider, period YYYY-MM, count)`.
+- A single statement does the check and the increment together:
+  `INSERT … ON CONFLICT DO UPDATE SET count = count + 1 WHERE count < cap
+  RETURNING count`. No returned row means the call is refused **before** it is
+  made.
+- It is race-safe: in a test, 20 threads racing against a cap of 5 got exactly 5
+  calls through.
+- `0` disables a provider; `-1` means unlimited. `GET /usage` shows this month's
+  usage against each cap.
+- **Limitations:**
+  - It counts logical calls, not HTTP requests. SDK-level retries (5 for the
+    OpenAI-compatible provider, 3 for Anthropic) all happen inside one charge.
+  - It counts calls, not tokens or dollars, so it is not a true dollar ceiling.
+  - A call is charged even if it then fails.
+  - Calls to the fake provider are counted too.
+
+### 8.2 Pacing — requests per minute, shared by all workers
+
+- Stored in `provider_pacing(provider, last_call_at)`.
+- One atomic update reserves the next slot as
+  `GREATEST(last_call_at + 60/rpm, clock_timestamp())` and returns how long to
+  wait. The worker sleeps **outside** the transaction, for at most 120 s, so it
+  never holds a row lock while waiting.
+- **Why it exists.** A concurrency cap does not limit request rate. Two workers
+  making 2 s calls sustain about 60 requests a minute, which free tiers refuse.
+- **Consequence.** At 12 requests a minute, extraction takes about
+  `chunks / 12` minutes. That is about 3 minutes for the 35-chunk test episode
+  and 15–17 minutes for a full 25-source episode (~200 chunks), against the
+  spec's 6-minute target.
+
+### 8.3 Concurrency slots
+
+- Each provider has N slots, implemented as Postgres advisory locks keyed by a
+  hash of `provider:slot`. A worker must take one with `pg_try_advisory_lock`
+  before calling out.
+- The lock is held on a **dedicated connection**, because advisory locks belong
+  to a session and a pooled connection returned mid-call would silently drop the
+  lock.
+- If no slot frees up within 30 s, the job is requeued as `SlotUnavailable`.
+
+### 8.4 Per-user quotas
+
+At most 10 episodes per user per day (`usage_counters`), and at most 25 sources
+per episode, checked both on user additions and in discover. The spec asked for
+these from day one because they are cheap now and painful to add later.
+
+### 8.5 Current proof-of-concept values
+
+| Setting | Value | Why |
+|---|---|---|
+| `BUDGET_LLM_CALLS_PER_MONTH` | 2000 | about a dozen full episodes |
+| `BUDGET_SEARCH_CALLS_PER_MONTH` | 300 | search is cheap per episode (~9 calls) |
+| `BUDGET_EMBEDDING_CALLS_PER_MONTH` | 500 | |
+| `PROVIDER_RPM_LLM` | 12 | stays under Gemini free-tier limits |
+| `PROVIDER_CAP_LLM` | 2 | |
+| `MAX_SOURCES_PER_EPISODE` | 8 | keeps one run from using up a day's quota |
+
+---
+
+## 9. The trust chain: how citations are guaranteed
+
+The goal is that every dossier line traces back to a claim, and every claim
+traces back to an exact span of a stored source.
+
+```mermaid
+flowchart LR
+  B["source bytes<br/>(blob, sha256)"] --> CH["chunk<br/>exact offsets or ms"]
+  CH --> CL["claim<br/>quote located in chunk"]
+  CL --> DI["dossier item<br/>claim ids verified"]
+  DI --> CI["citation<br/>chunk + span"]
+  CI --> UI["UI: quoted text<br/>+ link to source"]
+```
+
+| Link | Guard | Where |
+|---|---|---|
+| bytes → chunk | Chunk offsets must resolve to the chunk's own text; a CHECK constraint requires exactly one position pair | `pipeline/chunking.py`, `models.Chunk` |
+| chunk → claim | The quote must be found in the chunk, or the claim is dropped | `extract.locate_quote`, `extract.validate_claim` |
+| claim → dossier item | Claim ids must be real claims that were given to the model | `dossier.compose_section` |
+| item → citation | Built from the claim's chunk and span | `dossier.compose_section` |
+| citation → UI | The API returns the quoted text, not just an id | `routes/episodes._citations_for` |
+
+**What is guaranteed:** no dossier item without a valid claim id; every claim's
+span lies inside its chunk; a span found by quote actually contains the quoted
+text.
+
+**What is not guaranteed:**
+- that the quote **supports** the claim. A model can quote real text and then
+  write a claim that says more than the quote does;
+- that the claim is about the subject;
+- that script segments are cited at all.
+
+**Measured.** On real Gemini output, a rough word-overlap check found that 70%
+of spans supported their claims with the old offset method, and about 81% with
+the quote method (196 claims). The check is crude, and some of what it flags
+looks like acceptable paraphrase, so the true rate is probably higher. It has
+not been measured properly yet.
+
+**Next.** An automatic check that each quote supports its claim (an entailment
+model or a cheap LLM judge), plus real eval fixtures (§14).
+
+---
+
+## 10. Coverage modes and the topic brief
+
+Most guests at small companies have a thin public footprint. The spec calls
+this the common case, not the edge case: if the dossier came back empty the
+product would look broken. So coverage is scored (§5.8) and the UI says plainly
+what was found.
+
+| Mode | What the UI shows |
+|---|---|
+| `rich` | The full dossier |
+| `thin` | An amber banner: "limited public material", the count of usable and failed sources, and a specific list of things to paste in |
+| `sparse` | The same banner with stronger wording. The dossier should mostly become a topic and industry brief |
+
+`CoverageBanner` in `web/components/ui.tsx` never presents a thin result as a
+full one.
+
+### The topic brief: designed, not finished
+
+**The design** (from the spec): the topic and industry brief is not a second
+system. It creates a `topic` entity, runs the same discover, fetch, chunk,
+extract and cluster pipeline against it, and uses a different composer.
+
+**What the code does today:** `coverage_check` creates the topic entity and
+enqueues `discover` with `{"entity_id": <topic>, "mode": "topic"}`. But
+`run_discover` ignores that payload and searches for the **guest** again, and
+`parse_source` enqueues extraction with the **guest** as the subject. The topic
+entity never gets any claims, so the `topic_brief` section never appears. The
+acceptance test only checks that a thin or sparse dossier has *some* section,
+so it did not catch this.
+
+**To fix:** discover should read the entity from the job payload, the
+extraction subject should come from the job rather than the episode, and the
+topic composer's retrieval rules need checking.
+
+**Calibration.** The real run labelled Satya Nadella, one of the most-covered
+CEOs alive, as **thin**. Causes: the proof-of-concept limit of 8 sources (only 6
+parsed, below the ≥ 8 that rich requires), clusters that mean nothing under fake
+embeddings, and thresholds that have never been checked against real guests.
+
+---
+
+## 11. API
+
+Base URL `http://localhost:8000`. OpenAPI docs are at `/docs`. Everything except
+auth, `/health` and `/usage` needs a `Bearer` token, and episodes are scoped to
+their owner (another user gets a 404, never a 403, so episode ids cannot be
+probed).
+
+| Method | Path | What it does | Sync? |
+|---|---|---|---|
+| POST | `/auth/signup` | Create account, return JWT | sync |
+| POST | `/auth/login` | Return JWT | sync |
+| POST | `/episodes` | Create episode (the disambiguator is required); counts toward the daily quota | sync |
+| GET | `/episodes` | List the user's episodes | sync |
+| GET | `/episodes/{id}` | Episode, guest, sources, job progress, candidates. **The polling endpoint** | sync |
+| POST | `/episodes/{id}/identify` | Search and rank candidates | sync (inline) |
+| POST | `/episodes/{id}/confirm-guest` | Freeze the chosen identity, start ingestion | enqueues |
+| POST | `/episodes/{id}/sources` | Add a URL (fetched) or pasted text (parsed directly) | enqueues |
+| DELETE | `/episodes/{id}/sources/{sid}` | Soft-remove from this episode only | sync |
+| GET | `/episodes/{id}/dossier` | Sections, items and citations with quoted text | sync |
+| POST | `/episodes/{id}/topics` | Set 3–6 topics | sync |
+| POST | `/episodes/{id}/script` | Style preset plus optional voice sample | enqueues (202) |
+| GET | `/episodes/{id}/script` | Latest script with segments and citations | sync |
+| PATCH | `/scripts/{id}/segments/{sid}` | Edit a segment inline | sync |
+| GET | `/episodes/{id}/export?format=pdf` | PDF download | sync |
+| GET | `/health` | Liveness and which providers are active | sync |
+| GET | `/usage` | This month's calls against each budget | sync |
+
+---
+
+## 12. Frontend
+
+`web/` — Next.js 14 App Router, React 18, TanStack Query 5, Tailwind 3.
+
+| File | Contents |
+|---|---|
+| `app/page.tsx` | `AuthPanel` (sign up or sign in) and `EpisodeList` (create form plus list) |
+| `app/episodes/[id]/page.tsx` | The workspace: `IdentityStep`, `SourcesPanel`, `DossierPanel`, `TopicsPanel`, `ScriptPanel` and `SegmentCard` |
+| `lib/api.ts` | Fetch wrapper that attaches the JWT from `localStorage` and turns errors into `ApiError` |
+| `lib/types.ts` | TypeScript mirrors of the API schemas and section titles |
+| `components/ui.tsx` | `Button`, `Input`, `Textarea`, `Card`, `StatusPill`, `CoverageBanner`, `CitationList`, `ProgressBar` |
+
+**Polling.** The episode view refetches every 2 s while jobs are pending or the
+status is `ingesting`. The dossier view refetches every 3 s until it has
+sections, and the script view every 2.5 s until it has segments. Each stops
+once it has what it needs.
+
+**Flow.** The identity step calls identify automatically when the page opens and
+blocks until a candidate is chosen. The PDF export downloads through a blob,
+because the endpoint requires the bearer token.
+
+**Gaps.** The topics panel does not reload saved topics; it starts empty on each
+visit. Citation links open the source URL but do not jump to the quoted span or
+the YouTube timestamp; text-fragment and `&t=` deep links would fix that.
+
+---
+
+## 13. Configuration reference
+
+Every setting comes from environment variables, read in `api/scripto/config.py`
+and loaded from `api/.env` locally. There are no local-only shortcuts, so
+the same code can be deployed unchanged.
+
+| Group | Variable | Default | Purpose |
+|---|---|---|---|
+| Core | `DATABASE_URL` | `…@localhost:5432/scripto` | Postgres DSN (local dev uses 5433) |
+| | `JWT_SECRET`, `JWT_TTL_HOURS` | dev secret, 336 | Auth |
+| | `CORS_ORIGINS` | `http://localhost:3000` | Comma-separated list |
+| Blob | `BLOB_BACKEND` | `local` | `local` or `s3` |
+| | `BLOB_LOCAL_ROOT` | `./var/blobs` | |
+| | `S3_BUCKET`, `S3_ENDPOINT_URL`, `S3_REGION`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | — | When the backend is `s3` |
+| LLM | `LLM_PROVIDER` | `fake` | `anthropic`, `openai_compatible` or `fake` |
+| | `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`, `OPENAI_BASE_URL` | — | Credentials and endpoint |
+| | `LLM_EXTRACT_MODEL`, `LLM_COMPOSE_MODEL`, `LLM_RANK_MODEL` | Haiku 4.5, Opus 5, Haiku 4.5 | Model for each role |
+| | `LLM_EXTRACT_REASONING_EFFORT`, `LLM_COMPOSE_REASONING_EFFORT` | empty (not sent) | `none`, `low`, `medium` or `high` |
+| | `LLM_MAX_TOKENS` | 16000 | |
+| Embeddings | `EMBEDDING_PROVIDER` | `fake` | `gemini`, `voyage` or `fake` |
+| | `EMBEDDING_API_KEY`, `EMBEDDING_MODEL`, `EMBEDDING_DIM` | —, `voyage-3`, 1024 | The dimension is fixed by the schema |
+| Search | `SEARCH_PROVIDER`, `SEARCH_API_KEY` | `fake` | `duckduckgo` (no key), `exa`, `tavily` |
+| Pipeline | `MAX_SOURCES_PER_EPISODE` | 25 | |
+| | `MAX_EPISODES_PER_USER_PER_DAY` | 10 | |
+| | `CHUNK_TARGET_TOKENS`, `CHUNK_OVERLAP_TOKENS` | 750, 100 | |
+| | `CLUSTER_SIMILARITY_THRESHOLD` | 0.86 | |
+| | `ALREADY_COVERED_MIN_SOURCES` | 3 | |
+| | `COVERAGE_RICH_MIN_SOURCES`, `COVERAGE_RICH_MIN_CLUSTERS`, `COVERAGE_THIN_MIN_SOURCES` | 8, 15, 3 | |
+| Queue | `WORKER_CONCURRENCY` | 4 | Threads per worker process |
+| | `JOB_LEASE_SECONDS`, `JOB_MAX_ATTEMPTS`, `WORKER_POLL_INTERVAL_SECONDS` | 600, 4, 1.0 | |
+| Limits | `PROVIDER_CAP_{LLM,SEARCH,FETCH,EMBEDDING}` | 8, 2, 6, 4 | Concurrent calls |
+| | `PROVIDER_RPM_{LLM,SEARCH,EMBEDDING,FETCH}` | 0 (unpaced) | Requests per minute |
+| | `BUDGET_{LLM,SEARCH,EMBEDDING,FETCH}_CALLS_PER_MONTH` | 2000, 300, 500, −1 | Hard ceilings |
+| Web | `NEXT_PUBLIC_API_URL` | `http://localhost:8000` | In `web/.env.local` |
+
+**Current proof-of-concept `api/.env`** (keys omitted): `LLM_PROVIDER=openai_compatible`,
+`OPENAI_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai/`,
+`gemini-3.1-flash-lite` for all three roles, `EMBEDDING_PROVIDER=fake`,
+`SEARCH_PROVIDER=duckduckgo`, plus the limits in §8.5.
+
+---
+
+## 14. Testing, provider checks and evals
+
+### Tests — `api/tests/`, 38 of them
+
+| File | What it covers |
+|---|---|
+| `test_units.py` | Span and quote guards, fabricated quotes being rejected, chunk offsets resolving, URL canonicalisation, YouTube ids, idempotency, fair dequeue, lease recovery, backoff until dead |
+| `test_e2e.py` | A full run through export, the §9 acceptance criteria (failed sources degrade but never fail the run, thin/sparse labelling, reparse with no network, repeated-story clustering, global source dedupe, per-episode removal), the dossier rebuild regression, access control |
+| `test_budget.py` | Budget refusal, disabling a provider, unlimited budgets, a concurrency race against the budget, pacing, pacing shared across workers |
+
+- Tests run against **real Postgres** (the `scripto_test` database) and the
+  **real queue**. `tests/drain.py` runs jobs through the same dequeue, handler
+  and failure path the worker uses. Only the external providers are faked.
+- `conftest.py` pins quotas, budgets and pacing, so a low cap set in a
+  developer's `.env` for cost reasons cannot silently change what the tests
+  exercise.
+
+### Provider check — `python -m scripto.check_provider`
+
+This is how to evaluate a new provider before spending money on it (§7).
+
+### Evals — `evals/runner.py`
+
+- Each fixture is JSON: the guest, sources, **facts that must appear**, and
+  **traps that must not** (the wrong person with the same name, an outdated
+  role, a claim about somebody else).
+- For each fixture the runner reports recall on required facts, the number of
+  unsourced sentences, and trap hits. It rebuilds the schema fresh each time.
+- The repeated-story check is skipped under fake embeddings, because they cannot
+  match paraphrases.
+- **There is only one fixture, and it is made up.** The spec asks for ten real
+  guests. This is the biggest gap (§17).
+- Warning: the runner drops and recreates every table in `scripto_test`.
+
+### The main testing lesson
+
+Fake providers test the *shape* of the system, not its behaviour on real input.
+All tests passed while a column was too short for any real model name and while
+30% of citations pointed at the wrong text. See §16.
+
+---
+
+## 15. Local development environment
+
+Details specific to this machine that are not obvious from the code:
+
+- An **EDB PostgreSQL 16** install at `/Library/PostgreSQL/16` already occupies
+  port 5432 and is password protected. It was left untouched.
+- Scripto uses **Homebrew `postgresql@16` on port 5433**, configured in
+  `/opt/homebrew/var/postgresql@16/postgresql.conf`.
+- **pgvector 0.8.0 was compiled from source**, because Homebrew's `pgvector`
+  bottle only supports PostgreSQL 17 and 18.
+- There are two databases: `scripto` for development and `scripto_test` for
+  tests and evals.
+- Python 3.12 comes from `uv` (the system has 3.14). Node is 20, with npm.
+- **There is no Docker yet.** Because all configuration comes from the
+  environment, adding a Dockerfile and compose file later needs no code changes.
+
+Running it:
+
+```bash
+brew services start postgresql@16
+cd api && .venv/bin/alembic upgrade head
+.venv/bin/uvicorn scripto.main:app --port 8000        # API
+.venv/bin/python -m scripto.jobs.worker               # worker
+cd web && npm run dev                                 # http://localhost:3000
+```
+
+---
+
+## 16. What real-provider testing taught us
+
+These bugs were found only once real providers, real content and real
+concurrency were involved.
+
+| Symptom | Root cause | Fix | Why the fakes missed it |
+|---|---|---|---|
+| Every claim insert failed and the dossier showed 0 claims | `extractor_version` was VARCHAR(32), but the real value is 60 characters | Widened to 255 | The fake's version is `fake:v1`, 7 characters |
+| Gemini returned a bare array | `json_object` only guarantees valid JSON, not the right shape | `json_schema` strict, then a fallback, then `coerce_to_schema` | The fake returns exactly the schema's shape |
+| Responses cut off mid-string | `max_tokens` 4096, and reasoning models think before they answer | 16000 | The fake has no token limit |
+| 46.6 s per extraction call | A thinking budget spent on a mechanical task | Reasoning effort per role; `flash-lite` | The fake returns instantly |
+| Free-tier 429s | Only concurrency was capped, not request rate | The pacing layer (§8.2) | The fake has no rate limit |
+| Deadlock in clustering | Concurrent runs rewriting the same guest's clusters | A per-subject transaction advisory lock | It needs real concurrent timing |
+| Dossier stuck empty but marked ready | The first build ran with 0 claims; its idempotency key blocked every rebuild | Key includes the claim count; empty output from real claims now raises | It needed extraction to fail first |
+| Cluster rebuild failed | A foreign key from `dossier_items` blocked deleting clusters | ON DELETE SET NULL | It needed a dossier built before re-clustering |
+| 30% of citations pointed at unrelated text | Models report character offsets badly | Ask for the quote and find it in code | The fake computes its spans correctly |
+
+Found while building, before real providers:
+
+- Jobs were invisible to dequeue because `now()` is the transaction's start time
+  (§6.4).
+- `passlib` does not work with modern `bcrypt`.
+- Dependencies were missing: `email-validator`, and `openai`, which was declared
+  but never installed.
+- Quotas set in `.env` leaked into the test environment.
+
+**Takeaway.** A check that a value is "in bounds" is not a check that it is
+correct. "The tests pass" meant the plumbing had the right shape. Every change
+to models or prompts should be validated on real output, which is why the eval
+set matters.
+
+---
+
+## 17. Known gaps and open problems
+
+In rough priority order:
+
+1. **Output quality cannot be measured.** There is one made-up eval fixture
+   against the ten real ones the spec asks for. Any change could quietly make
+   dossiers worse.
+2. **Citation support is about 81%** by a crude check. Nothing verifies that a
+   quote supports its claim, and nothing verifies that a claim is about the
+   subject.
+3. **The topic brief is not wired** (§10), so thin and sparse guests do not get
+   the topic material the spec promises.
+4. **"Already covered" has never run on real embeddings.** Clustering happens in
+   Python.
+5. **Coverage thresholds are uncalibrated.** Nadella came out as thin.
+6. **Speed on the free tier.** A 25-source episode takes about 15 minutes at
+   12 requests a minute, against a 6-minute target. No complete run has been
+   timed end to end.
+7. **Scripts.** Segments can be uncited, regenerating discards edits, and script
+   quality has not been judged on real claims.
+8. **The coverage check does not wait for clustering**, so the dossier can be
+   built from stale clusters.
+9. **Recent news depends on `claim_date`**, which is often empty.
+10. **Chunk embeddings are stored but never used.**
+11. **The budget counts logical calls**, not HTTP retries, tokens or dollars.
+12. **Orchestration is implicit**, with a self-rescheduling coverage check
+    rather than an explicit stage graph.
+13. **Never tested live:** Anthropic, Exa, Tavily, Voyage, Gemini embeddings,
+    S3, real PDFs.
+14. **DuckDuckGo is unofficial** and could break.
+15. **Google Doc export is missing.**
+16. **Security:** the JWT is in `localStorage`, there are no refresh tokens and
+    no login rate limiting.
+17. **No deployment setup:** no Docker, no CI.
+18. **Frontend:** saved topics are not reloaded, and citations do not deep-link
+    to the span or timestamp.
+
+---
+
+## 18. Deferred work and the seams left for it
+
+| Deferred (spec §1) | The seam that is already in place |
+|---|---|
+| Whisper transcription | `WhisperStrategy` in `adapters/youtube.py` reports `available() == False`. Turning it on means downloading audio and returning the same `Segment` list. Chunking, extraction and claims do not change |
+| LinkedIn vendor adapter | A `profile` source type and `classify_url()` routing already exist. Add an adapter behind a feature flag |
+| S3 storage | `S3Blob` implements the `Blob` interface. Set `BLOB_BACKEND=s3` |
+| Teams and sharing | Every row carries `user_id`. A workspace layer would sit above it |
+| Containers and deployment | Configuration is entirely environment-driven. Add a Dockerfile and compose file |
+
+---
+
+## 19. Code map
+
+```
+api/
+  pyproject.toml, alembic.ini, .env.example
+  scripto/
+    config.py            all settings, from the environment
+    db.py                engine (bounded pool), sessions, Base
+    models.py            17 tables
+    schemas.py           Pydantic request and response models
+    auth.py              password hashing, JWT, current_user dependency
+    blob.py              Blob interface, LocalBlob, S3Blob
+    main.py              FastAPI app, CORS, /health, /usage
+    check_provider.py    LLM provider smoke test
+    adapters/            base (ParsedSource, canonicalize_url), web_article,
+                         youtube (TranscriptStrategy), simple (pdf, user_pasted)
+    search/              duckduckgo, exa, tavily, fake
+    embeddings/          gemini, voyage, fake
+    llm/                 base (interface, JSON parsing, coerce_to_schema),
+                         anthropic_provider, openai_provider, fake, prompts
+    jobs/                queue (enqueue, fair dequeue, sweeper), worker,
+                         registry, limits (budget, pacing, slots)
+    pipeline/            identify, discover, fetch (fetch + parse), chunking,
+                         embed, extract, cluster, coverage, dossier, script
+    routes/              auth, episodes, export
+    migrations/          Alembic environment and 5 versions
+  tests/                 conftest, drain, test_units, test_e2e, test_budget
+web/
+  app/                   layout, providers, page (auth + list), episodes/[id]
+  lib/                   api client, types
+  components/ui.tsx      shared UI, CoverageBanner, CitationList
+evals/
+  runner.py              recall / unsourced / trap report
+  fixtures/              dana-reyes.json (synthetic)
+docs/
+  system-design.md       this document
+build-spec-v1.md         the original spec
+```

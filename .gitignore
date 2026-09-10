@@ -1,0 +1,23 @@
+# python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# secrets and local config -- never commit
+.env
+.env*.local
+
+# local data: blobs, eval and test artifacts
+var/
+
+# web
+node_modules/
+.next/
+next-env.d.ts
+*.tsbuildinfo
+
+# os
+.DS_Store

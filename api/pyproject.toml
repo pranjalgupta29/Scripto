@@ -1,0 +1,53 @@
+[project]
+name = "scripto-api"
+version = "0.1.0"
+description = "Scripto podcast research platform API"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "sqlalchemy>=2.0.36",
+    "alembic>=1.14",
+    "psycopg[binary]>=3.2",
+    "pgvector>=0.3.6",
+    "pydantic[email]>=2.10",
+    "pydantic-settings>=2.7",
+    "python-multipart>=0.0.20",
+    "bcrypt>=4.2",
+    "pyjwt>=2.10",
+    "anthropic>=0.69",
+    "openai>=1.59",
+    "httpx>=0.28",
+    "tenacity>=9.0",
+    "selectolax>=0.3.27",
+    "trafilatura>=2.0",
+    "pypdf>=5.1",
+    "youtube-transcript-api>=0.6.3",
+    "tiktoken>=0.8",
+    "numpy>=2.1",
+    "reportlab>=4.2",
+    "structlog>=24.4",
+    "ddgs>=9.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.25",
+    "ruff>=0.8",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["scripto"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
