@@ -6,6 +6,7 @@ import type {
   Episode,
   Script,
   SourceOut,
+  SuggestTopicsResponse,
   Topic,
 } from "./types";
 
@@ -119,9 +120,22 @@ export const api = {
       body: JSON.stringify({ topics }),
     }),
 
+  getTopics: (id: string) => request<Topic[]>(`/episodes/${id}/topics`),
+
+  suggestTopics: (id: string) =>
+    request<SuggestTopicsResponse>(`/episodes/${id}/topics/suggest`, {
+      method: "POST",
+    }),
+
   createScript: (
     id: string,
-    body: { style_preset: string; voice_sample?: string },
+    body: {
+      style_preset: string;
+      duration_minutes?: number;
+      optimize_order?: boolean;
+      include_bonus?: boolean;
+      voice_sample?: string;
+    },
   ) =>
     request<Script>(`/episodes/${id}/script`, {
       method: "POST",
@@ -134,6 +148,10 @@ export const api = {
     scriptId: string,
     segmentId: string,
     body: Partial<{
+      title: string;
+      transition_in: string;
+      host_script: string;
+      deeper_questions: string[];
       question: string;
       rationale: string;
       expected_direction: string;

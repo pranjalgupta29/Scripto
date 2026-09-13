@@ -145,24 +145,94 @@ class FakeProvider(LLMProvider):
 
     # -- script ---------------------------------------------------------
     def _task_generate_script(self, prompt: str) -> dict[str, Any]:
-        topics = re.findall(r"\[topic:([0-9a-f-]{36})\]\s*(.+)", prompt)
-        claim_ids = re.findall(r"\[([0-9a-f-]{36})\]", prompt)
-        segments = []
-        for i, (topic_id, topic_text) in enumerate(topics):
-            segments.append(
+        """A complete run-of-show that follows the caller's timing plan."""
+        plan = re.findall(
+            r"^- \[topic:([0-9a-f-]{36})\] (.+?) \| (\d+) min \| (\d+) questions$",
+            prompt,
+            re.MULTILINE,
+        )
+        claim_ids = re.findall(r"^\[([0-9a-f-]{36})\]", prompt, re.MULTILINE)
+
+        blocks = []
+        previous = "your background"
+        for i, (topic_id, text, _minutes, count) in enumerate(plan):
+            topic = text.strip()
+            blocks.append(
                 {
                     "topic_id": topic_id,
-                    "question": f"What is your current thinking on {topic_text.strip()}?",
-                    "rationale": "Opens the topic without repeating prior coverage.",
-                    "expected_direction": "Likely to reference their recent work.",
-                    "followups": [
-                        f"If they cite market conditions, ask how that changed since last year.",
+                    "title": topic,
+                    "transition_in": f"You mentioned {previous}; that leads us to {topic}.",
+                    "lead_question": f"What is your current thinking on {topic}?",
+                    "deeper_questions": [
+                        f"Deeper question {n + 1} on {topic}." for n in range(int(count) - 1)
                     ],
+                    "followups": [
+                        "If they cite market conditions, ask how that changed since last year."
+                    ],
+                    "rationale": "Opens the topic without repeating prior coverage.",
+                    "expected_direction": f"Likely to reference their recent work on {topic}.",
                     "risk_flags": [],
                     "claim_ids": claim_ids[i : i + 1],
                 }
             )
-        return {"segments": segments}
+            previous = topic
+
+        out: dict[str, Any] = {
+            "opening": {
+                "hook": "A cold open built from the guest's own words.",
+                "guest_intro": "Our guest today leads research at their firm.",
+                "first_question": "How did you get started?",
+                "claim_ids": claim_ids[:1],
+            },
+            "blocks": blocks,
+            "closing": {
+                "transition_in": f"Before we wrap up on {previous},",
+                "final_question": "What should listeners watch for next?",
+                "wrap_up": "Thanks for joining us.",
+                "claim_ids": [],
+            },
+        }
+        if "backup topics that are not in the plan" in prompt:
+            out["bonus"] = [
+                {
+                    "title": "Backup: first role",
+                    "why": "Grounded fallback if a block runs short.",
+                    "lead_question": "What did your first role teach you?",
+                    "followups": [],
+                    "claim_ids": claim_ids[:1],
+                },
+                {
+                    "title": "Backup: industry outlook",
+                    "why": "Title-driven fallback.",
+                    "lead_question": "Where is the industry heading?",
+                    "followups": [],
+                    "claim_ids": [],
+                },
+            ]
+        return out
+
+    def _task_suggest_topics(self, prompt: str) -> dict[str, Any]:
+        """Grounded suggestions from the research, plus one from the title alone."""
+        pairs = re.findall(
+            r"^\[([0-9a-f-]{36})\](?:\s*\([^)]*\))?\s*(.+)$", prompt, re.MULTILINE
+        )
+        title = _extract_field(prompt, "Episode title") or "this episode"
+        suggestions = [
+            {
+                "text": f"The story behind: {text.strip()[:60]}",
+                "why": "Grounded in the research.",
+                "claim_ids": [claim_id],
+            }
+            for claim_id, text in pairs[:4]
+        ]
+        suggestions.append(
+            {
+                "text": f"Where {title} goes next",
+                "why": "Implied by the episode title; not researched.",
+                "claim_ids": [],
+            }
+        )
+        return {"suggestions": suggestions}
 
     def _task_voice_descriptors(self, prompt: str) -> dict[str, Any]:
         return {

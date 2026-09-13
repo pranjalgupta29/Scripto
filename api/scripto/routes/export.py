@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 
 from scripto.auth import current_user
 from scripto.db import get_db
-from scripto.models import DossierItem, Episode, Script, ScriptSegment, Topic, User
+from scripto.models import DossierItem, Episode, Script, ScriptSegment, User
 from scripto.routes.episodes import _citations_for, _owned_episode
 
 router = APIRouter(tags=["export"])
@@ -105,10 +105,10 @@ def export_episode(
         .limit(1)
     )
     if script is not None:
-        story.append(Paragraph("Script", styles["Heading2"]))
-        topics = {
-            t.id: t.text for t in db.scalars(select(Topic).where(Topic.episode_id == episode.id))
-        }
+        heading = "Script"
+        if script.duration_minutes:
+            heading = f"Script: {script.duration_minutes}-minute run of show"
+        story.append(Paragraph(_esc(heading), styles["Heading2"]))
         segments = list(
             db.scalars(
                 select(ScriptSegment)
@@ -116,26 +116,14 @@ def export_episode(
                 .order_by(ScriptSegment.ordinal)
             )
         )
-        for segment in segments:
-            if segment.topic_id in topics:
-                story.append(Paragraph(_esc(topics[segment.topic_id]), styles["Heading4"]))
-            story.append(Paragraph(f"<b>Q.</b> {_esc(segment.question)}", styles["BodyText"]))
-            if segment.rationale:
-                story.append(Paragraph(f"<i>Why:</i> {_esc(segment.rationale)}", cite_style))
-            if segment.followups:
-                story.append(
-                    ListFlowable(
-                        [
-                            ListItem(Paragraph(_esc(str(f)), cite_style))
-                            for f in segment.followups
-                        ],
-                        bulletType="bullet",
-                    )
-                )
-            if segment.risk_flags:
-                flags = ", ".join(str(f) for f in segment.risk_flags)
-                story.append(Paragraph(f"<b>Flags:</b> {_esc(flags)}", cite_style))
-            story.append(Spacer(1, 8))
+        main = [s for s in segments if s.segment_type != "bonus"]
+        backup = [s for s in segments if s.segment_type == "bonus"]
+        for segment in main:
+            _render_segment(story, segment, styles, cite_style)
+        if backup:
+            story.append(Paragraph("Backup topics (if time allows)", styles["Heading3"]))
+            for segment in backup:
+                _render_segment(story, segment, styles, cite_style)
 
     if len(story) <= 3:
         raise HTTPException(status.HTTP_409_CONFLICT, "nothing to export yet")
@@ -157,3 +145,50 @@ def _esc(text: str) -> str:
         .replace("<", "&lt;")
         .replace(">", "&gt;")
     )
+
+
+def _clock(minute: int) -> str:
+    return f"{minute // 60}:{minute % 60:02d}"
+
+
+def _render_segment(story: list, segment: ScriptSegment, styles, cite_style) -> None:
+    heading = segment.title or segment.segment_type.title()
+    if segment.start_minute is not None and segment.planned_minutes:
+        end = segment.start_minute + segment.planned_minutes
+        heading = f"{_clock(segment.start_minute)}-{_clock(end)}  {heading}"
+    story.append(Paragraph(_esc(heading), styles["Heading4"]))
+
+    if segment.transition_in:
+        story.append(
+            Paragraph(f"<i>Transition:</i> {_esc(segment.transition_in)}", styles["BodyText"])
+        )
+    if segment.host_script:
+        story.append(Paragraph(f"<i>Say:</i> {_esc(segment.host_script)}", styles["BodyText"]))
+    story.append(Paragraph(f"<b>Q.</b> {_esc(segment.question)}", styles["BodyText"]))
+    if segment.deeper_questions:
+        story.append(
+            ListFlowable(
+                [
+                    ListItem(Paragraph(_esc(str(q)), styles["BodyText"]))
+                    for q in segment.deeper_questions
+                ],
+                bulletType="1",
+            )
+        )
+    if segment.rationale:
+        story.append(Paragraph(f"<i>Why:</i> {_esc(segment.rationale)}", cite_style))
+    if segment.followups:
+        story.append(
+            ListFlowable(
+                [ListItem(Paragraph(_esc(str(f)), cite_style)) for f in segment.followups],
+                bulletType="bullet",
+            )
+        )
+    if segment.risk_flags:
+        flags = ", ".join(str(f) for f in segment.risk_flags)
+        story.append(Paragraph(f"<b>Flags:</b> {_esc(flags)}", cite_style))
+    if segment.flagged_unsourced:
+        story.append(
+            Paragraph("<b>Not backed by the research.</b> Check before asking.", cite_style)
+        )
+    story.append(Spacer(1, 8))

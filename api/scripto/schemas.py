@@ -146,22 +146,56 @@ class TopicOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class TopicSuggestion(BaseModel):
+    text: str
+    why: str | None = None
+    # "research": rests on cited claims, shown with evidence.
+    # "title": implied by the episode title only; nothing researched backs it.
+    basis: Literal["research", "title"]
+    claim_ids: list[str] = []
+    citations: list[CitationOut] = []
+
+
+class SuggestTopicsResponse(BaseModel):
+    episode_id: uuid.UUID
+    coverage_mode: str | None
+    suggestions: list[TopicSuggestion]
+
+
 class CreateScriptRequest(BaseModel):
     style_preset: Literal["formal", "conversational", "contrarian", "educational"]
     voice_sample: str | None = Field(
         default=None, description="Optional past-episode transcript to match voice."
+    )
+    duration_minutes: int = Field(
+        default=60, ge=10, le=240, description="Planned interview length in minutes."
+    )
+    optimize_order: bool = Field(
+        default=True,
+        description="Let the generator order topics for the best conversational arc.",
+    )
+    include_bonus: bool = Field(
+        default=True, description="Also suggest backup topics for when time allows."
     )
 
 
 class SegmentOut(BaseModel):
     id: uuid.UUID
     ordinal: int
+    segment_type: str = "topic"
+    title: str | None = None
+    start_minute: int | None = None
+    planned_minutes: int | None = None
     topic_id: uuid.UUID | None
+    transition_in: str | None = None
+    host_script: str | None = None
     question: str
+    deeper_questions: list[Any] = []
     rationale: str | None
     expected_direction: str | None
     followups: list[Any]
     risk_flags: list[Any]
+    flagged_unsourced: bool = False
     edited_by_user: bool
     citations: list[CitationOut] = []
 
@@ -171,12 +205,17 @@ class ScriptResponse(BaseModel):
     episode_id: uuid.UUID
     style_preset: str
     model_version: str
+    duration_minutes: int | None = None
     created_at: datetime
     segments: list[SegmentOut]
 
 
 class PatchSegmentRequest(BaseModel):
+    title: str | None = None
+    transition_in: str | None = None
+    host_script: str | None = None
     question: str | None = None
+    deeper_questions: list[str] | None = None
     rationale: str | None = None
     expected_direction: str | None = None
     followups: list[str] | None = None

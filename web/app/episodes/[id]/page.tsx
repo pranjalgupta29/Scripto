@@ -20,7 +20,6 @@ import {
 
 export default function EpisodePage() {
   const { id } = useParams<{ id: string }>();
-  const queryClient = useQueryClient();
 
   const episode = useQuery({
     queryKey: ["episode", id],
@@ -392,32 +391,87 @@ function DossierPanel({ episodeId }: { episodeId: string }) {
 }
 
 /* ------------------------------------------------------------------ */
-/* 4. topics — the user supplies these, we never suggest them           */
+/* 4. topics — the host's own, plus suggestions that say what backs them */
 /* ------------------------------------------------------------------ */
+
+const MAX_TOPICS = 6;
 
 function TopicsPanel({ episodeId }: { episodeId: string }) {
   const queryClient = useQueryClient();
   const [topics, setTopics] = useState<string[]>(["", "", ""]);
+  const [hydrated, setHydrated] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const stored = useQuery({
+    queryKey: ["topics", episodeId],
+    queryFn: () => api.getTopics(episodeId),
+  });
+
+  // Show topics saved on an earlier visit instead of starting blank.
+  useEffect(() => {
+    if (hydrated || !stored.data) return;
+    if (stored.data.length) {
+      const texts = stored.data.map((t) => t.text);
+      while (texts.length < 3) texts.push("");
+      setTopics(texts);
+      setSaved(true);
+    }
+    setHydrated(true);
+  }, [stored.data, hydrated]);
+
+  const suggest = useMutation({
+    mutationFn: () => api.suggestTopics(episodeId),
+    onError: (e: ApiError) => setError(e.message),
+  });
 
   const save = useMutation({
     mutationFn: () => api.setTopics(episodeId, topics.filter((t) => t.trim())),
     onSuccess: () => {
       setSaved(true);
+      queryClient.invalidateQueries({ queryKey: ["topics", episodeId] });
       queryClient.invalidateQueries({ queryKey: ["episode", episodeId] });
     },
     onError: (e: ApiError) => setError(e.message),
   });
 
   const filled = topics.filter((t) => t.trim()).length;
+  const alreadyHas = (text: string) =>
+    topics.some((t) => t.trim().toLowerCase() === text.trim().toLowerCase());
+
+  const addTopic = (text: string) => {
+    if (alreadyHas(text)) return;
+    const empty = topics.findIndex((t) => !t.trim());
+    if (empty >= 0) {
+      const next = [...topics];
+      next[empty] = text;
+      setTopics(next);
+    } else if (topics.length < MAX_TOPICS) {
+      setTopics([...topics, text]);
+    }
+    setSaved(false);
+  };
 
   return (
     <Card>
-      <h2 className="text-sm font-semibold">Topics</h2>
-      <p className="mt-1 text-xs text-black/55">
-        3 to 6 topics you want the episode to cover.
-      </p>
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h2 className="text-sm font-semibold">Topics</h2>
+          <p className="mt-1 text-xs text-black/55">
+            3 to 6 topics you want the episode to cover.
+          </p>
+        </div>
+        <Button
+          variant="ghost"
+          onClick={() => {
+            setError(null);
+            suggest.mutate();
+          }}
+          disabled={suggest.isPending}
+        >
+          {suggest.isPending ? "Thinking…" : "Suggest topics"}
+        </Button>
+      </div>
 
       <div className="mt-3 space-y-2">
         {topics.map((topic, i) => (
@@ -435,7 +489,10 @@ function TopicsPanel({ episodeId }: { episodeId: string }) {
             {topics.length > 3 ? (
               <Button
                 variant="ghost"
-                onClick={() => setTopics(topics.filter((_, j) => j !== i))}
+                onClick={() => {
+                  setTopics(topics.filter((_, j) => j !== i));
+                  setSaved(false);
+                }}
               >
                 ×
               </Button>
@@ -445,7 +502,7 @@ function TopicsPanel({ episodeId }: { episodeId: string }) {
       </div>
 
       <div className="mt-3 flex items-center gap-2">
-        {topics.length < 6 ? (
+        {topics.length < MAX_TOPICS ? (
           <Button variant="ghost" onClick={() => setTopics([...topics, ""])}>
             Add topic
           </Button>
@@ -462,19 +519,107 @@ function TopicsPanel({ episodeId }: { episodeId: string }) {
         {saved ? <span className="text-xs text-emerald-700">Saved</span> : null}
       </div>
       {error ? <p className="mt-2 text-sm text-red-700">{error}</p> : null}
+
+      {suggest.data ? (
+        <div className="mt-5 border-t border-black/10 pt-4">
+          <p className="text-xs font-semibold uppercase tracking-wide text-black/45">
+            Suggested from the episode title and the research
+          </p>
+          {!suggest.data.suggestions.length ? (
+            <p className="mt-2 text-sm text-black/50">No new suggestions.</p>
+          ) : null}
+          <ul className="mt-2 space-y-2">
+            {suggest.data.suggestions.map((s) => {
+              const added = alreadyHas(s.text);
+              return (
+                <li
+                  key={s.text}
+                  className="flex items-start justify-between gap-3 rounded-md border border-black/10 p-3"
+                >
+                  <div className="min-w-0">
+                    <p className="text-sm font-medium">{s.text}</p>
+                    {s.why ? (
+                      <p className="mt-0.5 text-xs text-black/55">{s.why}</p>
+                    ) : null}
+                    <span
+                      className={`mt-1 inline-block rounded border px-1.5 py-0.5 text-[11px] ${
+                        s.basis === "research"
+                          ? "border-emerald-200 bg-emerald-50 text-emerald-800"
+                          : "border-amber-300 bg-amber-50 text-amber-900"
+                      }`}
+                    >
+                      {s.basis === "research"
+                        ? "Backed by research"
+                        : "From the title only — not researched"}
+                    </span>
+                    <CitationList citations={s.citations.slice(0, 1)} />
+                  </div>
+                  <Button
+                    variant="ghost"
+                    disabled={added || filled >= MAX_TOPICS}
+                    onClick={() => addTopic(s.text)}
+                  >
+                    {added ? "Added" : "Add"}
+                  </Button>
+                </li>
+              );
+            })}
+          </ul>
+          {filled >= MAX_TOPICS ? (
+            <p className="mt-2 text-xs text-black/50">
+              Six topics is the maximum. Remove one to add another.
+            </p>
+          ) : (
+            <p className="mt-2 text-xs text-black/50">
+              Added suggestions still need saving.
+            </p>
+          )}
+        </div>
+      ) : null}
     </Card>
   );
 }
 
 /* ------------------------------------------------------------------ */
-/* 5. script                                                           */
+/* 5. script — a timed run-of-show                                     */
 /* ------------------------------------------------------------------ */
 
 const STYLES = ["formal", "conversational", "contrarian", "educational"];
+const DURATIONS = [30, 45, 60, 90, 120];
+
+function clock(minute: number) {
+  return `${Math.floor(minute / 60)}:${String(minute % 60).padStart(2, "0")}`;
+}
+
+function Chip({
+  active,
+  onClick,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={`rounded-full border px-3 py-1 text-xs capitalize transition ${
+        active
+          ? "border-ink bg-ink text-white"
+          : "border-black/15 hover:border-black/40"
+      }`}
+    >
+      {children}
+    </button>
+  );
+}
 
 function ScriptPanel({ episodeId }: { episodeId: string }) {
   const queryClient = useQueryClient();
   const [style, setStyle] = useState("conversational");
+  const [duration, setDuration] = useState(60);
+  const [optimizeOrder, setOptimizeOrder] = useState(true);
+  const [includeBonus, setIncludeBonus] = useState(true);
   const [voiceSample, setVoiceSample] = useState("");
   const [error, setError] = useState<string | null>(null);
 
@@ -490,6 +635,9 @@ function ScriptPanel({ episodeId }: { episodeId: string }) {
     mutationFn: () =>
       api.createScript(episodeId, {
         style_preset: style,
+        duration_minutes: duration,
+        optimize_order: optimizeOrder,
+        include_bonus: includeBonus,
         voice_sample: voiceSample || undefined,
       }),
     onSuccess: () => {
@@ -509,32 +657,74 @@ function ScriptPanel({ episodeId }: { episodeId: string }) {
     URL.revokeObjectURL(url);
   };
 
+  const segments = script.data?.segments ?? [];
+  const timeline = segments.filter((s) => s.segment_type !== "bonus");
+  const backups = segments.filter((s) => s.segment_type === "bonus");
+  const hasEdits = segments.some((s) => s.edited_by_user);
+
   return (
     <Card>
       <div className="flex items-center justify-between">
         <h2 className="text-sm font-semibold">Script</h2>
-        {script.data?.segments.length ? (
+        {segments.length ? (
           <Button variant="ghost" onClick={download}>
             Export PDF
           </Button>
         ) : null}
       </div>
 
-      <div className="mt-3 space-y-3">
-        <div className="flex flex-wrap gap-2">
-          {STYLES.map((preset) => (
-            <button
-              key={preset}
-              onClick={() => setStyle(preset)}
-              className={`rounded-full border px-3 py-1 text-xs capitalize transition ${
-                style === preset
-                  ? "border-ink bg-ink text-white"
-                  : "border-black/15 hover:border-black/40"
-              }`}
-            >
-              {preset}
-            </button>
-          ))}
+      <div className="mt-3 space-y-4">
+        <div>
+          <p className="mb-1.5 text-xs font-medium text-black/60">
+            Interview length
+          </p>
+          <div className="flex flex-wrap gap-2">
+            {DURATIONS.map((minutes) => (
+              <Chip
+                key={minutes}
+                active={duration === minutes}
+                onClick={() => setDuration(minutes)}
+              >
+                {minutes >= 60 && minutes % 60 === 0
+                  ? `${minutes / 60} hr`
+                  : `${minutes} min`}
+              </Chip>
+            ))}
+          </div>
+        </div>
+
+        <div>
+          <p className="mb-1.5 text-xs font-medium text-black/60">Style</p>
+          <div className="flex flex-wrap gap-2">
+            {STYLES.map((preset) => (
+              <Chip
+                key={preset}
+                active={style === preset}
+                onClick={() => setStyle(preset)}
+              >
+                {preset}
+              </Chip>
+            ))}
+          </div>
+        </div>
+
+        <div className="space-y-1.5">
+          <label className="flex items-center gap-2 text-xs text-black/70">
+            <input
+              type="checkbox"
+              checked={optimizeOrder}
+              onChange={(e) => setOptimizeOrder(e.target.checked)}
+            />
+            Let Scripto order the topics for the best flow
+          </label>
+          <label className="flex items-center gap-2 text-xs text-black/70">
+            <input
+              type="checkbox"
+              checked={includeBonus}
+              onChange={(e) => setIncludeBonus(e.target.checked)}
+            />
+            Include backup topics for when a block runs short
+          </label>
         </div>
 
         <Textarea
@@ -544,37 +734,77 @@ function ScriptPanel({ episodeId }: { episodeId: string }) {
           onChange={(e) => setVoiceSample(e.target.value)}
         />
 
-        <Button
-          onClick={() => {
-            setError(null);
-            generate.mutate();
-          }}
-          disabled={generate.isPending}
-        >
-          {generate.isPending
-            ? "Generating…"
-            : script.data?.segments.length
-              ? "Regenerate script"
-              : "Generate script"}
-        </Button>
+        <div className="flex items-center gap-3">
+          <Button
+            onClick={() => {
+              setError(null);
+              generate.mutate();
+            }}
+            disabled={generate.isPending}
+          >
+            {generate.isPending
+              ? "Generating…"
+              : segments.length
+                ? "Regenerate script"
+                : "Generate script"}
+          </Button>
+          {hasEdits ? (
+            <span className="text-xs text-amber-800">
+              Regenerating replaces your edits.
+            </span>
+          ) : null}
+        </div>
         {error ? <p className="text-sm text-red-700">{error}</p> : null}
       </div>
 
-      {script.data?.segments.length ? (
-        <div className="mt-6 space-y-4">
-          {script.data.segments.map((segment) => (
-            <SegmentCard
-              key={segment.id}
-              scriptId={script.data!.id}
-              segment={segment}
-              episodeId={episodeId}
-            />
-          ))}
+      {timeline.length ? (
+        <div className="mt-6">
+          <p className="text-xs font-semibold uppercase tracking-wide text-black/45">
+            {script.data?.duration_minutes
+              ? `${script.data.duration_minutes}-minute run of show`
+              : "Run of show"}{" "}
+            · {script.data?.style_preset}
+          </p>
+          <div className="mt-3 space-y-3">
+            {timeline.map((segment) => (
+              <SegmentCard
+                key={segment.id}
+                scriptId={script.data!.id}
+                segment={segment}
+                episodeId={episodeId}
+              />
+            ))}
+          </div>
+        </div>
+      ) : null}
+
+      {backups.length ? (
+        <div className="mt-6">
+          <p className="text-xs font-semibold uppercase tracking-wide text-black/45">
+            Backup topics — if a block runs short or falls flat
+          </p>
+          <div className="mt-3 space-y-3">
+            {backups.map((segment) => (
+              <SegmentCard
+                key={segment.id}
+                scriptId={script.data!.id}
+                segment={segment}
+                episodeId={episodeId}
+              />
+            ))}
+          </div>
         </div>
       ) : null}
     </Card>
   );
 }
+
+const TYPE_LABELS: Record<string, string> = {
+  opening: "Opening",
+  topic: "Topic",
+  closing: "Closing",
+  bonus: "Backup",
+};
 
 function SegmentCard({
   scriptId,
@@ -588,20 +818,56 @@ function SegmentCard({
   const queryClient = useQueryClient();
   const [editing, setEditing] = useState(false);
   const [question, setQuestion] = useState(segment.question);
+  const [transition, setTransition] = useState(segment.transition_in ?? "");
 
   const save = useMutation({
     mutationFn: () =>
-      api.patchSegment(scriptId, segment.id, { question }),
+      api.patchSegment(scriptId, segment.id, {
+        question,
+        transition_in: transition,
+      }),
     onSuccess: () => {
       setEditing(false);
       queryClient.invalidateQueries({ queryKey: ["script", episodeId] });
     },
   });
 
+  const timing =
+    segment.start_minute !== null && segment.planned_minutes
+      ? `${clock(segment.start_minute)}–${clock(
+          segment.start_minute + segment.planned_minutes,
+        )} · ${segment.planned_minutes} min`
+      : TYPE_LABELS[segment.segment_type];
+  const bookend =
+    segment.segment_type === "opening" || segment.segment_type === "closing";
+
   return (
-    <div className="rounded-md border border-black/10 p-4">
+    <div
+      className={`rounded-md border border-black/10 p-4 ${bookend ? "bg-black/[0.02]" : ""}`}
+    >
+      <div className="flex items-baseline justify-between gap-3">
+        <p className="text-sm font-semibold">
+          {segment.title ?? TYPE_LABELS[segment.segment_type]}
+        </p>
+        <span className="shrink-0 text-xs tabular-nums text-black/45">
+          {timing}
+        </span>
+      </div>
+
       {editing ? (
-        <div className="space-y-2">
+        <div className="mt-3 space-y-2">
+          {segment.segment_type !== "bonus" ? (
+            <Textarea
+              rows={2}
+              placeholder={
+                segment.segment_type === "opening"
+                  ? "Hook"
+                  : "Transition into this block"
+              }
+              value={transition}
+              onChange={(e) => setTransition(e.target.value)}
+            />
+          ) : null}
           <Textarea
             rows={2}
             value={question}
@@ -615,6 +881,7 @@ function SegmentCard({
               variant="ghost"
               onClick={() => {
                 setQuestion(segment.question);
+                setTransition(segment.transition_in ?? "");
                 setEditing(false);
               }}
             >
@@ -625,12 +892,36 @@ function SegmentCard({
       ) : (
         <button
           onClick={() => setEditing(true)}
-          className="w-full text-left"
+          className="mt-2 w-full text-left"
           title="Click to edit"
         >
-          <p className="font-medium">{segment.question}</p>
+          {segment.transition_in ? (
+            <p className="text-sm text-black/60">
+              <span className="mr-1 text-[11px] font-medium uppercase tracking-wide text-black/40">
+                {segment.segment_type === "opening" ? "Hook" : "Transition"}
+              </span>
+              <span className="italic">“{segment.transition_in}”</span>
+            </p>
+          ) : null}
+          {segment.host_script ? (
+            <p className="mt-1 text-sm text-black/70">
+              <span className="mr-1 text-[11px] font-medium uppercase tracking-wide text-black/40">
+                Say
+              </span>
+              {segment.host_script}
+            </p>
+          ) : null}
+          <p className="mt-2 font-medium">{segment.question}</p>
         </button>
       )}
+
+      {segment.deeper_questions?.length ? (
+        <ol className="mt-2 list-decimal space-y-0.5 pl-5 text-sm text-black/75">
+          {segment.deeper_questions.map((q, i) => (
+            <li key={i}>{q}</li>
+          ))}
+        </ol>
+      ) : null}
 
       {segment.rationale ? (
         <p className="mt-2 text-xs text-black/55">
@@ -654,8 +945,13 @@ function SegmentCard({
         </ul>
       ) : null}
 
-      {segment.risk_flags?.length ? (
+      {segment.risk_flags?.length || segment.flagged_unsourced ? (
         <div className="mt-2 flex flex-wrap gap-1">
+          {segment.flagged_unsourced ? (
+            <span className="rounded border border-red-200 bg-red-50 px-1.5 py-0.5 text-[11px] text-red-800">
+              Not backed by the research — check before asking
+            </span>
+          ) : null}
           {segment.risk_flags.map((flag, i) => (
             <span
               key={i}

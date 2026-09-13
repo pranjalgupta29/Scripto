@@ -45,7 +45,9 @@ or X handle). Scripto:
    source text,
 4. writes a **dossier** — career timeline, recent news, public positions, things
    they have said repeatedly ("already covered"), unexplored angles,
-5. writes an interview **script** for the host's chosen topics and style,
+5. suggests topics from the episode title and the research, then writes a timed
+   **run-of-show** for the host's topics, length and style: an opening, one block
+   per topic with a spoken transition into each, backup topics, and a closing,
 6. lets the host edit it and export a PDF.
 
 The product promise is that **every line links back to a source the host can
@@ -55,6 +57,11 @@ Scope, from `build-spec-v1.md`: one episode, one guest, one script.
 Explicit non-goals for v1: no LinkedIn/Instagram scraping, no audio
 transcription (YouTube captions only), no team collaboration, no publishing, no
 topic ideation (the user supplies topics), no billing.
+
+**Scope change (2026-09-14).** Topic ideation was a v1 non-goal. The host asked
+for it, so Scripto now suggests topics, each labelled as backed by research or
+taken from the episode title alone (§5.10). The script also grew from one
+question per topic into a timed run-of-show.
 
 ---
 
@@ -152,7 +159,7 @@ Each entry: what we chose, why, what we rejected, and when to revisit.
   PDFs (`pypdf`), YouTube captions (`youtube-transcript-api`), tokenisers
   (`tiktoken`) and first-party LLM SDKs. FastAPI gives typed request and response
   models through Pydantic and generates OpenAPI docs at `/docs`. SQLAlchemy 2's
-  typed mappings keep models readable. Alembic manages migrations; there are 5 so
+  typed mappings keep models readable. Alembic manages migrations; there are 6 so
   far.
 - **Python version.** The machine has 3.14, but several libraries lag behind, so
   `uv` pins a 3.12 virtualenv.
@@ -349,7 +356,7 @@ erDiagram
 | `claim_clusters` | Groups of claims that say the same thing | `source_count` counts **distinct sources**, not claims |
 | `topics` | The host's 3–6 topics | |
 | `dossier_items` | One dossier line | Carries `claim_ids`. `cluster_id` is ON DELETE SET NULL |
-| `scripts` / `script_segments` | Script versions and their questions | Segments hold rationale, expected direction, follow-ups, risk flags and `edited_by_user` |
+| `scripts` / `script_segments` | Script versions and their timed blocks | `scripts.duration_minutes`. Each segment is an opening, topic, closing or backup block with start minute, planned minutes, transition, host lines, lead and deeper questions, follow-ups, risk flags, `flagged_unsourced` and `edited_by_user` |
 | `citations` | Links a dossier item or segment to a chunk span | `target_type` is dossier_item or script_segment |
 | `jobs` | The work queue | §6 |
 | `usage_counters` | Per-user daily quotas | |
@@ -368,7 +375,8 @@ and `embedding`. Jobs gained `idempotency_key`. Episodes gained
 
 `api/scripto/migrations/versions/`, in order: initial schema (which also creates
 the `vector` extension), provider budgets, provider pacing, widen
-`extractor_version`, dossier cluster FK set null.
+`extractor_version`, dossier cluster FK set null, run-of-show script segments
+(which also widens `scripts.model_version` for the same reason as §16).
 
 ---
 
@@ -394,6 +402,7 @@ flowchart TD
 | Stage | Triggered by | External calls | Idempotency key | If it fails |
 |---|---|---|---|---|
 | identify | `POST /identify`, inline | 2 searches, 1 LLM | none | 422 to the user |
+| suggest topics | `POST /topics/suggest`, inline | 1 LLM | none | 429 / 503 / 502 to the user |
 | discover | confirm-guest | ~7 searches | `discover:{episode}` | per-query errors are skipped |
 | fetch_source | discover or user URL | 1 fetch | `fetch:{source}` | source marked failed; the job itself succeeds |
 | parse_source | fetch or pasted text | none | `parse:{source}:{checksum}` | source marked failed |
@@ -573,29 +582,89 @@ flowchart TD
 - `recent_news` depends on `claim_date`, which extraction often leaves empty.
   The real run produced one item there.
 
-### 5.10 Generate script — `pipeline/script.py`
+### 5.10 Topic suggestions and the run-of-show — `pipeline/suggest.py`, `pipeline/script.py`
 
-- **Voice sample.** One call turns an uploaded transcript into style descriptors
-  (pacing, register, question length, signature moves). Only the descriptors go
-  into the script prompt, never the transcript itself, as the spec requires.
-- **Inputs:** topics (tagged `[topic:id]`), dossier lines (each with its first
-  claim id), the canonical text of already-covered clusters, and the style brief
-  for `formal`, `conversational`, `contrarian` or `educational`.
-- One compose call produces every segment. Each segment's `topic_id` is
-  validated, falling back to the topic at the same position, and its claim ids
-  are filtered down to real claims about the subject. Citations are created.
-  Regenerating replaces the segments.
-- **Gaps.** A segment with no valid claim id is **kept**, which contradicts the
-  spec's "every line in the script links to a source". Regenerating discards the
-  user's edits. Script quality has not been judged on real claims.
+**Topic suggestions** (`POST /topics/suggest`, inline like identify, one compose call):
+
+- The model gets the episode title (the theme), the guest, the host's existing
+  topics, the dossier lines with their claim ids, and what the guest has already
+  covered repeatedly.
+- Each suggestion is labelled in code, not by the model: **research** if at least
+  one of its claim ids is a real claim about the guest, otherwise **title** ("from
+  the title only — not researched"). Research suggestions come back with a quoted
+  citation.
+- Repeats of the host's topics and duplicate suggestions are dropped in code.
+  Suggestions are not stored; the host adds the ones they want to their topics.
+- This reverses a v1 non-goal (§1).
+
+**The run-of-show.** A script is an ordered list of blocks, each a
+`script_segments` row with a `segment_type`:
+
+| Block | Holds |
+|---|---|
+| opening | a hook, a guest introduction built from cited research, a warm-up first question |
+| topic (one per host topic) | a spoken transition in, a lead question, deeper questions, follow-ups, rationale, expected direction, risk flags |
+| closing | a transition, a final question, a one-line wrap-up |
+| bonus (backup) | 2–3 topics outside the plan, for when a block runs short or falls flat; not on the clock |
+
+**The code owns the clock** (`plan_run_of_show`). Models are bad at arithmetic
+(the same lesson as character offsets, §5.6), so the timing is computed first and
+given to the model as fixed:
+
+- opening and closing each get about 7% of the length, between 2 and 8 minutes;
+- the rest is split equally across topics, with spare minutes going to the
+  earliest ones, so the blocks always add up to exactly the booked length;
+- each topic's question count is its minutes divided by the style's pace (about 4
+  minutes per question for conversational and contrarian, 5 for formal and
+  educational), capped at 8.
+
+Example: 60 minutes, conversational, 3 topics gives an opening 0:00–0:04, topic
+blocks of 18, 17 and 17 minutes with 4 questions each, and a closing 0:56–1:00.
+
+**Flow.** Each topic block starts with a transition the host can say aloud, built
+on where the guest will likely have gone in the previous block (its expected
+direction). By default the model may reorder topics for a better arc; with
+`optimize_order: false` the code enforces the host's order. Start times are set in
+code after the order is fixed.
+
+**Guards in code:**
+
+- a topic the model skipped still gets its slot, with a placeholder question and an
+  "auto-filled" risk flag;
+- deeper questions are cut to the planned count;
+- claim ids are filtered to real claims about the guest, and citations are built
+  from them;
+- any block except the closing that cites nothing is kept but marked
+  `flagged_unsourced`, and the UI and PDF show that. Dropping it would leave a hole
+  in the timeline;
+- bare UUIDs are removed from every text list, since Gemini put a claim id into
+  `risk_flags` on the first real run;
+- regenerating replaces the blocks and their citations.
+
+**Voice sample.** One call turns an uploaded transcript into style descriptors
+(pacing, register, question length, signature moves). Only the descriptors reach
+the script prompt, never the transcript.
+
+**First real run** (Gemini `flash-lite`, Nadella, 60 minutes, 2026-09-14): 10
+suggestions in 4.7 s (9 research, 1 title-only). The script took 9 s, added up to
+exactly 60 minutes, and every block cited research. Transitions read naturally, for
+example: "That tension between efficiency and human agency brings us back to how a
+massive organization actually changes its own DNA." Problems seen: a claim id
+returned as a risk flag (now filtered in code); the closing transition stated
+facts (cricket, his time at Sun) despite the rule against it; two suggestions
+showed the same evidence quote, and one quote did not support its topic.
+
+**Gaps.** Regenerating discards the host's edits. Nothing enforces "no facts in
+transitions". Script quality has been judged on this one run only.
 
 ### 5.11 Editing and export
 
 - `PATCH /scripts/{id}/segments/{sid}` updates fields and sets `edited_by_user`.
 - `GET /export?format=pdf` builds a PDF with `reportlab`: a limited-coverage
   banner for thin and sparse episodes, dossier sections with up to 3 source
-  labels per item, and script segments with the question, its rationale,
-  follow-ups and flags. User text is escaped, because reportlab parses input as
+  labels per item, and the timed run-of-show: each block's clock time,
+  transition, host lines, lead and deeper questions, rationale, follow-ups and
+  flags, then the backup topics. User text is escaped, because reportlab parses input as
   mini-HTML.
 - Google Doc export is **not built**.
 
@@ -829,7 +898,9 @@ text.
 - that the quote **supports** the claim. A model can quote real text and then
   write a claim that says more than the quote does;
 - that the claim is about the subject;
-- that script segments are cited at all.
+- that script blocks are cited: a block that cites nothing is kept but flagged,
+  because dropping it would leave a hole in the timeline;
+- that a transition states no facts about the guest (it is a prompt rule only).
 
 **Measured.** On real Gemini output, a rough word-overlap check found that 70%
 of spans supported their claims with the old offset method, and about 81% with
@@ -903,7 +974,9 @@ probed).
 | DELETE | `/episodes/{id}/sources/{sid}` | Soft-remove from this episode only | sync |
 | GET | `/episodes/{id}/dossier` | Sections, items and citations with quoted text | sync |
 | POST | `/episodes/{id}/topics` | Set 3–6 topics | sync |
-| POST | `/episodes/{id}/script` | Style preset plus optional voice sample | enqueues (202) |
+| GET | `/episodes/{id}/topics` | The saved topics | sync |
+| POST | `/episodes/{id}/topics/suggest` | Topic suggestions from the title and research, each labelled research or title-only | sync (inline) |
+| POST | `/episodes/{id}/script` | Style, length (10–240 min), topic-order option, backup topics on/off, optional voice sample | enqueues (202) |
 | GET | `/episodes/{id}/script` | Latest script with segments and citations | sync |
 | PATCH | `/scripts/{id}/segments/{sid}` | Edit a segment inline | sync |
 | GET | `/episodes/{id}/export?format=pdf` | PDF download | sync |
@@ -933,8 +1006,17 @@ once it has what it needs.
 blocks until a candidate is chosen. The PDF export downloads through a blob,
 because the endpoint requires the bearer token.
 
-**Gaps.** The topics panel does not reload saved topics; it starts empty on each
-visit. Citation links open the source URL but do not jump to the quoted span or
+**Topics and script.** The topics panel loads saved topics, and **Suggest topics**
+lists suggestions with a green "backed by research" or amber "from the title
+only" badge and one quote as evidence; **Add** puts one into an empty topic slot.
+The script panel takes a length (30 min to 2 hr), a style, whether Scripto may
+reorder topics, and whether to add backup topics. The run-of-show shows each
+block's clock time, hook or transition, host lines, lead and deeper questions,
+follow-ups, risk flags, a red "not backed by the research" badge where a block
+cites nothing, and citations. The question and transition are editable inline,
+and a warning appears when regenerating would replace edits.
+
+**Gaps.** Citation links open the source URL but do not jump to the quoted span or
 the YouTube timestamp; text-fragment and `&t=` deep links would fix that.
 
 ---
@@ -983,12 +1065,12 @@ the same code can be deployed unchanged.
 
 ## 14. Testing, provider checks and evals
 
-### Tests — `api/tests/`, 38 of them
+### Tests — `api/tests/`, 67 of them
 
 | File | What it covers |
 |---|---|
-| `test_units.py` | Span and quote guards, fabricated quotes being rejected, chunk offsets resolving, URL canonicalisation, YouTube ids, idempotency, fair dequeue, lease recovery, backoff until dead |
-| `test_e2e.py` | A full run through export, the §9 acceptance criteria (failed sources degrade but never fail the run, thin/sparse labelling, reparse with no network, repeated-story clustering, global source dedupe, per-episode removal), the dossier rebuild regression, access control |
+| `test_units.py` | Span and quote guards, fabricated quotes being rejected, chunk offsets resolving, URL canonicalisation, YouTube ids, idempotency, fair dequeue, lease recovery, backoff until dead, run-of-show timing, claim ids kept out of script text |
+| `test_e2e.py` | A full run through export, the §9 acceptance criteria (failed sources degrade but never fail the run, thin/sparse labelling, reparse with no network, repeated-story clustering, global source dedupe, per-episode removal), the dossier rebuild regression, access control, topic suggestions, the timed run-of-show, host topic order, question count by length |
 | `test_budget.py` | Budget refusal, disabling a provider, unlimited budgets, a concurrency race against the budget, pacing, pacing shared across workers |
 
 - Tests run against **real Postgres** (the `scripto_test` database) and the
@@ -1067,6 +1149,8 @@ concurrency were involved.
 | Dossier stuck empty but marked ready | The first build ran with 0 claims; its idempotency key blocked every rebuild | Key includes the claim count; empty output from real claims now raises | It needed extraction to fail first |
 | Cluster rebuild failed | A foreign key from `dossier_items` blocked deleting clusters | ON DELETE SET NULL | It needed a dossier built before re-clustering |
 | 30% of citations pointed at unrelated text | Models report character offsets badly | Ask for the quote and find it in code | The fake computes its spans correctly |
+| A claim id showed up as a script risk flag | Gemini put a claim UUID into `risk_flags` | Bare UUIDs are dropped from every text list in a block | The fake never does it |
+| After a restart, every database call failed | Settings found `.env` relative to the working directory. Started from `web/`, the API and worker fell back to a default that pointed at the other Postgres on port 5432 | `.env` and blob storage are located relative to the code, and `DATABASE_URL` is now required | Tests always run from `api/` |
 
 Found while building, before real providers:
 
@@ -1102,8 +1186,10 @@ In rough priority order:
 6. **Speed on the free tier.** A 25-source episode takes about 15 minutes at
    12 requests a minute, against a 6-minute target. No complete run has been
    timed end to end.
-7. **Scripts.** Segments can be uncited, regenerating discards edits, and script
-   quality has not been judged on real claims.
+7. **Scripts.** Regenerating discards the host's edits. Transitions are told not
+   to state facts about the guest, but nothing enforces it. Script quality has
+   been judged on one real run only. (Uncited blocks are now flagged, not
+   silently kept.)
 8. **The coverage check does not wait for clustering**, so the dossier can be
    built from stale clusters.
 9. **Recent news depends on `claim_date`**, which is often empty.
@@ -1118,8 +1204,11 @@ In rough priority order:
 16. **Security:** the JWT is in `localStorage`, there are no refresh tokens and
     no login rate limiting.
 17. **No deployment setup:** no Docker, no CI.
-18. **Frontend:** saved topics are not reloaded, and citations do not deep-link
-    to the span or timestamp.
+18. **Frontend:** citations do not deep-link to the span or timestamp.
+19. **Suggestion evidence can be weak.** Each suggestion shows one quote. On the
+    first real run two suggestions showed the same quote, and one did not really
+    support its topic. A title-only suggestion can still state an unsourced fact
+    in its explanation.
 
 ---
 
@@ -1158,7 +1247,8 @@ api/
     jobs/                queue (enqueue, fair dequeue, sweeper), worker,
                          registry, limits (budget, pacing, slots)
     pipeline/            identify, discover, fetch (fetch + parse), chunking,
-                         embed, extract, cluster, coverage, dossier, script
+                         embed, extract, cluster, coverage, dossier, script,
+                         suggest
     routes/              auth, episodes, export
     migrations/          Alembic environment and 5 versions
   tests/                 conftest, drain, test_units, test_e2e, test_budget

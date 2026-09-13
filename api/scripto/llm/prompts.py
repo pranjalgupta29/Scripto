@@ -226,39 +226,98 @@ def dossier_prompt(section: str, subject: str, claims: list[tuple[str, str, str 
 # script generation
 # --------------------------------------------------------------------------
 
-SCRIPT_SYSTEM = """You draft interview questions for a podcast host.
+SCRIPT_SYSTEM = """You write a complete interview run-of-show for a podcast host: \
+an opening, one block per topic, spoken transitions between blocks, optional backup \
+topics, and a closing.
 
-Each segment covers one of the host's topics. A good question is specific to this \
-guest and grounded in what the research actually found -- not a question you could \
-ask anyone in their field.
+Rules:
+- The timing plan is fixed by the caller. Write content that fits the minutes and \
+the number of questions given for each block. Do not invent timings.
+- A transition is a short line the host can say out loud to move from the previous \
+block into this one. Build it on where the guest will likely have gone in the \
+previous block (its expected direction), so the conversation flows instead of \
+jumping. Transitions must not state facts about the guest.
+- Questions must be specific to this guest and grounded in the research, not \
+questions you could ask anyone in their field. Cite the claim ids each block rests on.
+- The opening has a hook, a short guest introduction built only from cited \
+research, and a warm-up first question.
+- The closing has a transition, a final question, and a one-line wrap-up.
+- Set risk_flags where the guest has already answered something repeatedly \
+elsewhere, or where a topic is commercially or legally sensitive for them."""
 
-Set risk_flags where they apply, especially when the guest has already answered \
-something repeatedly elsewhere, or where a topic is commercially or legally \
-sensitive for them. Cite the claim ids the question rests on."""
+_ID_LIST: dict[str, Any] = {"type": "array", "items": {"type": "string"}}
+_TEXT_LIST: dict[str, Any] = {"type": "array", "items": {"type": "string"}}
 
 SCRIPT_SCHEMA: dict[str, Any] = {
     "title": "generate_script",
     "type": "object",
     "additionalProperties": False,
-    "required": ["segments"],
+    "required": ["opening", "blocks", "closing"],
     "properties": {
-        "segments": {
+        "opening": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["hook", "guest_intro", "first_question", "claim_ids"],
+            "properties": {
+                "hook": {"type": "string"},
+                "guest_intro": {"type": "string"},
+                "first_question": {"type": "string"},
+                "claim_ids": _ID_LIST,
+            },
+        },
+        "blocks": {
             "type": "array",
             "items": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["topic_id", "question", "rationale"],
+                "required": [
+                    "topic_id",
+                    "title",
+                    "transition_in",
+                    "lead_question",
+                    "deeper_questions",
+                    "claim_ids",
+                ],
                 "properties": {
                     "topic_id": {"type": "string"},
-                    "question": {"type": "string"},
+                    "title": {"type": "string"},
+                    "transition_in": {"type": "string"},
+                    "lead_question": {"type": "string"},
+                    "deeper_questions": _TEXT_LIST,
+                    "followups": _TEXT_LIST,
                     "rationale": {"type": "string"},
                     "expected_direction": {"type": "string"},
-                    "followups": {"type": "array", "items": {"type": "string"}},
-                    "risk_flags": {"type": "array", "items": {"type": "string"}},
-                    "claim_ids": {"type": "array", "items": {"type": "string"}},
+                    "risk_flags": _TEXT_LIST,
+                    "claim_ids": _ID_LIST,
                 },
             },
-        }
+        },
+        "bonus": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["title", "why", "lead_question", "claim_ids"],
+                "properties": {
+                    "title": {"type": "string"},
+                    "why": {"type": "string"},
+                    "lead_question": {"type": "string"},
+                    "followups": _TEXT_LIST,
+                    "claim_ids": _ID_LIST,
+                },
+            },
+        },
+        "closing": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["transition_in", "final_question", "wrap_up"],
+            "properties": {
+                "transition_in": {"type": "string"},
+                "final_question": {"type": "string"},
+                "wrap_up": {"type": "string"},
+                "claim_ids": _ID_LIST,
+            },
+        },
     },
 }
 
@@ -271,31 +330,68 @@ STYLE_BRIEFS = {
 
 
 def script_prompt(
+    *,
+    episode_title: str,
     subject: str,
+    headline: str | None,
+    plan: dict,
     topics: list[tuple[str, str]],
     dossier_lines: list[str],
     style: str,
     voice_descriptors: dict | None,
     already_covered: list[str],
+    optimize_order: bool,
+    include_bonus: bool,
 ) -> str:
     lines = [
-        f"Guest: {subject}",
+        f"Episode title: {episode_title}",
+        f"Guest: {subject}" + (f" -- {headline}" if headline else ""),
         f"Style: {style} -- {STYLE_BRIEFS.get(style, '')}",
     ]
     if voice_descriptors:
         lines.append(f"Match this host's voice: {voice_descriptors}")
-    lines += ["", "Topics to cover:"]
-    for topic_id, text in topics:
-        lines.append(f"[topic:{topic_id}] {text}")
+
+    lines += [
+        f"Total duration: {plan['total']} minutes",
+        "",
+        "Timing plan (fixed):",
+        f"- Opening | {plan['opening']} min",
+    ]
+    for (topic_id, text), minutes, count in zip(
+        topics, plan["topic_minutes"], plan["questions"]
+    ):
+        lines.append(f"- [topic:{topic_id}] {text} | {minutes} min | {count} questions")
+    lines.append(f"- Closing | {plan['closing']} min")
+
+    lines.append("")
+    if optimize_order:
+        lines.append(
+            "Order: you may reorder the topic blocks to give the conversation the best "
+            "arc (for example warm-up, then depth, then forward-looking). Every topic "
+            "must appear exactly once, and each keeps its own minutes and question count."
+        )
+    else:
+        lines.append("Order: keep the topic blocks in exactly the order given.")
+    lines.append(
+        "Each block's question count includes its lead question; put the rest in "
+        "deeper_questions."
+    )
 
     lines += ["", "Research findings (claim id in brackets):"]
     lines.extend(dossier_lines or ["(no guest-specific findings)"])
 
     if already_covered:
-        lines += ["", "Already covered repeatedly elsewhere -- avoid or approach freshly:"]
+        lines += ["", "Already covered repeatedly elsewhere -- avoid, or find a fresh angle:"]
         lines.extend(f"- {c}" for c in already_covered)
 
-    lines += ["", "Produce one segment per topic, in the order given."]
+    if include_bonus:
+        lines += [
+            "",
+            "Also give 2 or 3 backup topics that are not in the plan, for when a block "
+            "runs short or falls flat. Ground them in the research where you can.",
+        ]
+    else:
+        lines += ["", "Do not include backup topics."]
     return "\n".join(lines)
 
 
@@ -331,3 +427,75 @@ def voice_prompt(transcript: str) -> str:
         "Describe this host's interviewing style.\n\n"
         f"<TRANSCRIPT>\n{transcript[:20000]}\n</TRANSCRIPT>"
     )
+
+
+# --------------------------------------------------------------------------
+# topic suggestions
+# --------------------------------------------------------------------------
+
+SUGGEST_SYSTEM = """You suggest interview topics for a podcast episode. The episode \
+title sets the theme; the research findings say what this guest can speak to.
+
+Rules:
+- Prefer topics grounded in the research. Each grounded topic must cite the claim \
+ids it rests on.
+- You may also suggest topics the title implies that the research does not cover. \
+Give those an empty claim_ids list; the host will be told they are unresearched.
+- Avoid what the guest has already covered repeatedly elsewhere, unless you offer a \
+genuinely fresh angle and say so in `why`.
+- Do not repeat the host's existing topics.
+- Phrase each topic as a short, specific label a host could put on a run-of-show, \
+not as a question."""
+
+SUGGEST_SCHEMA: dict[str, Any] = {
+    "title": "suggest_topics",
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["suggestions"],
+    "properties": {
+        "suggestions": {
+            "type": "array",
+            "maxItems": 10,
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["text", "why", "claim_ids"],
+                "properties": {
+                    "text": {"type": "string"},
+                    "why": {"type": "string"},
+                    "claim_ids": {"type": "array", "items": {"type": "string"}},
+                },
+            },
+        }
+    },
+}
+
+
+def suggest_prompt(
+    *,
+    episode_title: str,
+    subject: str,
+    headline: str | None,
+    existing_topics: list[str],
+    dossier_lines: list[str],
+    already_covered: list[str],
+) -> str:
+    lines = [
+        f"Episode title: {episode_title}",
+        f"Guest: {subject}" + (f" -- {headline}" if headline else ""),
+        "",
+        "Host's existing topics:",
+    ]
+    lines.extend(f"- {t}" for t in existing_topics)
+    if not existing_topics:
+        lines.append("(none yet)")
+
+    lines += ["", "Research findings (claim id in brackets):"]
+    lines.extend(dossier_lines or ["(no research findings yet)"])
+
+    if already_covered:
+        lines += ["", "Already covered repeatedly elsewhere:"]
+        lines.extend(f"- {c}" for c in already_covered)
+
+    lines += ["", "Suggest 6 to 10 topics for this episode."]
+    return "\n".join(lines)

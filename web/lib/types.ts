@@ -101,15 +101,25 @@ export interface Topic {
   text: string;
 }
 
+export type SegmentType = "opening" | "topic" | "closing" | "bonus";
+
 export interface Segment {
   id: string;
   ordinal: number;
+  segment_type: SegmentType;
+  title: string | null;
+  start_minute: number | null;
+  planned_minutes: number | null;
   topic_id: string | null;
+  transition_in: string | null;
+  host_script: string | null;
   question: string;
+  deeper_questions: string[];
   rationale: string | null;
   expected_direction: string | null;
   followups: string[];
   risk_flags: string[];
+  flagged_unsourced: boolean;
   edited_by_user: boolean;
   citations: Citation[];
 }
@@ -119,8 +129,23 @@ export interface Script {
   episode_id: string;
   style_preset: string;
   model_version: string;
+  duration_minutes: number | null;
   created_at: string;
   segments: Segment[];
+}
+
+export interface TopicSuggestion {
+  text: string;
+  why: string | null;
+  basis: "research" | "title";
+  claim_ids: string[];
+  citations: Citation[];
+}
+
+export interface SuggestTopicsResponse {
+  episode_id: string;
+  coverage_mode: CoverageMode | null;
+  suggestions: TopicSuggestion[];
 }
 
 export const SECTION_TITLES: Record<string, string> = {

@@ -5,15 +5,23 @@ unchanged in dev and in production.
 """
 
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# api/.env, located from this file rather than the process's working directory.
+# A worker started from another directory once missed it and silently fell back
+# to defaults that pointed at a different Postgres on port 5432.
+ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
+
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=ENV_FILE, extra="ignore")
 
     # --- core ---
-    database_url: str = "postgresql+psycopg://scripto:scripto@localhost:5432/scripto"
+    # Required, with no default: a missing database setting should stop the
+    # process at startup, not surface later as an auth error from the wrong server.
+    database_url: str
     jwt_secret: str = "dev-only-change-me"
     jwt_ttl_hours: int = 24 * 14
 

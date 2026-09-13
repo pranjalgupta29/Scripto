@@ -35,6 +35,20 @@ os.environ.setdefault("EMBEDDING_PROVIDER", "fake")
 os.environ.setdefault("SEARCH_PROVIDER", "fake")
 os.environ.setdefault("BLOB_LOCAL_ROOT", "./var/eval-blobs")
 
+# api/.env holds limits tuned for real providers (request pacing, source caps,
+# budgets). Pin them so they cannot slow or distort an eval run.
+for _key, _value in {
+    "PROVIDER_RPM_LLM": "0",
+    "PROVIDER_RPM_SEARCH": "0",
+    "PROVIDER_RPM_EMBEDDING": "0",
+    "PROVIDER_RPM_FETCH": "0",
+    "MAX_SOURCES_PER_EPISODE": "25",
+    "BUDGET_LLM_CALLS_PER_MONTH": "-1",
+    "BUDGET_SEARCH_CALLS_PER_MONTH": "-1",
+    "BUDGET_EMBEDDING_CALLS_PER_MONTH": "-1",
+}.items():
+    os.environ.setdefault(_key, _value)
+
 sys.path.insert(0, str(Path(__file__).parent.parent / "api"))
 
 from sqlalchemy import select, text  # noqa: E402

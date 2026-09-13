@@ -26,6 +26,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
+from sqlalchemy import text as sa_text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -345,12 +346,20 @@ class Script(Base, TimestampMixin):
     style_preset: Mapped[str] = mapped_column(String(32), nullable=False)
     voice_sample_ref: Mapped[str | None] = mapped_column(Text)
     voice_descriptors: Mapped[dict | None] = mapped_column(JSONB)
-    model_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    # "provider:extract_model/compose_model" -- the same long value that
+    # overflowed claims.extractor_version at 32 characters.
+    model_version: Mapped[str] = mapped_column(String(255), nullable=False)
+    duration_minutes: Mapped[int | None] = mapped_column(Integer)
 
 
 class ScriptSegment(Base):
     __tablename__ = "script_segments"
-    __table_args__ = (UniqueConstraint("script_id", "ordinal", name="uq_segment_script_ordinal"),)
+    __table_args__ = (
+        UniqueConstraint("script_id", "ordinal", name="uq_segment_script_ordinal"),
+        CheckConstraint(
+            "segment_type IN ('opening','topic','bonus','closing')", name="ck_segment_type"
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
     script_id: Mapped[uuid.UUID] = mapped_column(
@@ -365,6 +374,28 @@ class ScriptSegment(Base):
     risk_flags: Mapped[list] = mapped_column(JSONB, default=list, nullable=False)
     claim_ids: Mapped[list] = mapped_column(JSONB, default=list, nullable=False)
     edited_by_user: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    # Run-of-show structure. A script is an ordered list of blocks: one opening,
+    # one per topic, one closing, then optional backup ("bonus") topics that sit
+    # outside the timeline. The clock is computed in code, never by the model.
+    segment_type: Mapped[str] = mapped_column(
+        String(16), default="topic", server_default="topic", nullable=False
+    )
+    title: Mapped[str | None] = mapped_column(Text)
+    start_minute: Mapped[int | None] = mapped_column(Integer)
+    planned_minutes: Mapped[int | None] = mapped_column(Integer)
+    # Spoken bridge into this block (for the opening: the cold-open hook).
+    transition_in: Mapped[str | None] = mapped_column(Text)
+    # Words for the host to say (opening: guest intro; closing: wrap-up).
+    host_script: Mapped[str | None] = mapped_column(Text)
+    deeper_questions: Mapped[list] = mapped_column(
+        JSONB, default=list, server_default=sa_text("'[]'::jsonb"), nullable=False
+    )
+    # True when a block that should rest on research cites nothing. Shown to the
+    # host rather than silently dropped, since removing a block breaks the clock.
+    flagged_unsourced: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=sa_text("false"), nullable=False
+    )
 
 
 class Citation(Base):

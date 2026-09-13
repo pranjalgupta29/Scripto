@@ -352,3 +352,123 @@ def test_dossier_rebuilds_when_new_claims_arrive(auth_client, db, monkeypatch):
     rebuilt = auth_client.get(f"/episodes/{episode_id}/dossier").json()
     assert rebuilt["sections"], "dossier never rebuilt after claims arrived"
     assert any(item["citations"] for s in rebuilt["sections"] for item in s["items"])
+
+
+# --------------------------------------------------------------------------
+# topic suggestions and the timed run-of-show
+# --------------------------------------------------------------------------
+
+HOST_TOPICS = ["Private credit", "Liquidity risk", "Regulation"]
+
+
+def _ready_episode(auth_client) -> str:
+    episode_id = _episode_with_guest(auth_client)
+    auth_client.post(
+        f"/episodes/{episode_id}/sources", json={"text": LONG_TEXT, "title": "Dana Reyes bio"}
+    )
+    auth_client.post(f"/episodes/{episode_id}/topics", json={"topics": HOST_TOPICS})
+    drain()
+    return episode_id
+
+
+def test_saved_topics_can_be_read_back(auth_client):
+    episode_id = _episode_with_guest(auth_client)
+    auth_client.post(f"/episodes/{episode_id}/topics", json={"topics": HOST_TOPICS})
+    topics = auth_client.get(f"/episodes/{episode_id}/topics").json()
+    assert [t["text"] for t in topics] == HOST_TOPICS
+
+
+def test_topic_suggestions_say_what_backs_them(auth_client):
+    """A suggestion is either researched, with evidence, or labelled title-only."""
+    episode_id = _ready_episode(auth_client)
+
+    response = auth_client.post(f"/episodes/{episode_id}/topics/suggest")
+    assert response.status_code == 200, response.text
+    suggestions = response.json()["suggestions"]
+    assert suggestions
+
+    researched = [s for s in suggestions if s["basis"] == "research"]
+    title_only = [s for s in suggestions if s["basis"] == "title"]
+    assert researched, "expected suggestions grounded in the dossier"
+    for s in researched:
+        assert s["claim_ids"] and s["citations"], "researched suggestions must show evidence"
+        assert s["citations"][0]["quote"].strip()
+    for s in title_only:
+        assert not s["claim_ids"]
+
+    existing = {t.lower() for t in HOST_TOPICS}
+    assert not any(s["text"].lower() in existing for s in suggestions)
+
+
+def test_suggestions_need_a_confirmed_guest(auth_client):
+    created = auth_client.post(
+        "/episodes",
+        json={"title": "Ep", "guest_name": "Dana Reyes", "disambiguator": "Northwind Capital"},
+    ).json()
+    response = auth_client.post(f"/episodes/{created['id']}/topics/suggest")
+    assert response.status_code == 409
+
+
+def test_script_is_a_timed_run_of_show(auth_client):
+    episode_id = _ready_episode(auth_client)
+    created = auth_client.post(
+        f"/episodes/{episode_id}/script",
+        json={"style_preset": "conversational", "duration_minutes": 60},
+    )
+    assert created.status_code == 202, created.text
+    drain()
+
+    script = auth_client.get(f"/episodes/{episode_id}/script").json()
+    assert script["duration_minutes"] == 60
+    segments = script["segments"]
+    timeline = [s for s in segments if s["segment_type"] != "bonus"]
+
+    assert timeline[0]["segment_type"] == "opening"
+    assert timeline[-1]["segment_type"] == "closing"
+    topic_blocks = [s for s in timeline if s["segment_type"] == "topic"]
+    assert len(topic_blocks) == len(HOST_TOPICS)
+
+    # The blocks add up to the booked hour with no gaps or overlaps.
+    assert sum(s["planned_minutes"] for s in timeline) == 60
+    clock = 0
+    for block in timeline:
+        assert block["start_minute"] == clock
+        clock += block["planned_minutes"]
+
+    # Flow: every topic block has a spoken transition into it.
+    assert all(block["transition_in"] for block in topic_blocks)
+    # Backup topics sit outside the timeline.
+    backups = [s for s in segments if s["segment_type"] == "bonus"]
+    assert backups and all(b["start_minute"] is None for b in backups)
+
+
+def test_host_order_is_kept_when_asked(auth_client):
+    episode_id = _ready_episode(auth_client)
+    auth_client.post(
+        f"/episodes/{episode_id}/script",
+        json={"style_preset": "formal", "duration_minutes": 45, "optimize_order": False},
+    )
+    drain()
+    script = auth_client.get(f"/episodes/{episode_id}/script").json()
+    topics = auth_client.get(f"/episodes/{episode_id}/topics").json()
+    block_topics = [s["topic_id"] for s in script["segments"] if s["segment_type"] == "topic"]
+    assert block_topics == [t["id"] for t in topics]
+
+
+def test_longer_interview_gets_more_questions(auth_client):
+    episode_id = _ready_episode(auth_client)
+
+    def question_count(minutes: int) -> int:
+        auth_client.post(
+            f"/episodes/{episode_id}/script",
+            json={"style_preset": "conversational", "duration_minutes": minutes},
+        )
+        drain()
+        script = auth_client.get(f"/episodes/{episode_id}/script").json()
+        return sum(
+            1 + len(s["deeper_questions"])
+            for s in script["segments"]
+            if s["segment_type"] == "topic"
+        )
+
+    assert question_count(90) > question_count(30)

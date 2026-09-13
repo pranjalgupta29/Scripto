@@ -242,3 +242,39 @@ def test_validated_claim_span_always_supports_the_claim():
     assert claim is not None
     quoted = QUOTE_CHUNK[claim["span_start"] : claim["span_end"]]
     assert "Hit Refresh" in quoted, f"span points at unrelated text: {quoted!r}"
+
+
+# --------------------------------------------------------------------------
+# run-of-show timing: the code owns the clock, not the model
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("duration", [10, 30, 45, 60, 90, 120, 240])
+@pytest.mark.parametrize("n_topics", [3, 4, 6])
+def test_run_of_show_plan_fills_exactly_the_booked_time(duration, n_topics):
+    from scripto.pipeline.script import plan_run_of_show
+
+    plan = plan_run_of_show(duration, n_topics, "conversational")
+    assert plan["total"] == duration
+    assert plan["opening"] >= 2 and plan["closing"] >= 2
+    assert len(plan["topic_minutes"]) == n_topics
+    assert all(m >= 1 for m in plan["topic_minutes"])
+    assert all(q >= 1 for q in plan["questions"])
+
+
+def test_longer_interviews_plan_more_questions():
+    from scripto.pipeline.script import plan_run_of_show
+
+    short = plan_run_of_show(30, 4, "conversational")
+    long = plan_run_of_show(90, 4, "conversational")
+    assert sum(long["questions"]) > sum(short["questions"])
+
+
+def test_claim_ids_never_leak_into_script_text():
+    """Gemini once returned a claim id as a risk flag; it must not reach the host."""
+    from scripto.pipeline.script import _texts
+
+    cleaned = _texts(
+        ["Answered in 4 prior interviews", "53a2b199-50f9-46a7-87e5-55d91ae596f7", "  ", None]
+    )
+    assert cleaned == ["Answered in 4 prior interviews"]

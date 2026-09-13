@@ -11,7 +11,7 @@ from abc import ABC, abstractmethod
 from functools import lru_cache
 from pathlib import Path
 
-from scripto.config import settings
+from scripto.config import ENV_FILE, settings
 
 
 def checksum(data: bytes) -> str:
@@ -95,4 +95,15 @@ class S3Blob(Blob):
 def get_blob() -> Blob:
     if settings.blob_backend == "s3":
         return S3Blob()
-    return LocalBlob(settings.blob_local_root)
+    return LocalBlob(str(_local_root()))
+
+
+def _local_root() -> Path:
+    """A relative BLOB_LOCAL_ROOT is taken relative to api/, like .env itself.
+
+    Resolving it against the working directory meant a worker started from
+    another folder would read and write a different blob store, breaking
+    reparse-from-blob.
+    """
+    root = Path(settings.blob_local_root).expanduser()
+    return root if root.is_absolute() else ENV_FILE.parent / root

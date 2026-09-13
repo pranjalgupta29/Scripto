@@ -14,9 +14,12 @@ from scripto.blob import checksum, get_blob
 from scripto.config import settings
 from scripto.db import get_db
 from scripto.jobs import queue
+from scripto.jobs.limits import BudgetExceeded, SlotUnavailable
+from scripto.llm import LLMError
 from scripto.models import (
     Chunk,
     Citation,
+    Claim,
     DossierItem,
     Episode,
     EpisodeSource,
@@ -45,8 +48,10 @@ from scripto.schemas import (
     ScriptResponse,
     SegmentOut,
     SourceOut,
+    SuggestTopicsResponse,
     TopicOut,
     TopicsRequest,
+    TopicSuggestion,
 )
 
 router = APIRouter(tags=["episodes"])
@@ -452,6 +457,87 @@ def set_topics(
     return [TopicOut.model_validate(t) for t in topics]
 
 
+@router.get("/episodes/{episode_id}/topics", response_model=list[TopicOut])
+def get_topics(
+    episode_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> list[TopicOut]:
+    episode = _owned_episode(episode_id, db, user)
+    topics = db.scalars(
+        select(Topic).where(Topic.episode_id == episode.id).order_by(Topic.ordinal)
+    )
+    return [TopicOut.model_validate(t) for t in topics]
+
+
+@router.post("/episodes/{episode_id}/topics/suggest", response_model=SuggestTopicsResponse)
+def suggest_episode_topics(
+    episode_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> SuggestTopicsResponse:
+    """Suggest topics from the episode title and the research. Runs inline."""
+    from scripto.pipeline.suggest import suggest_topics
+
+    episode = _owned_episode(episode_id, db, user)
+    if episode.guest_entity_id is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "confirm the guest before asking for topic suggestions"
+        )
+
+    try:
+        suggestions = suggest_topics(db, episode)
+    except BudgetExceeded as exc:
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, str(exc)) from exc
+    except SlotUnavailable as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+    except LLMError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"suggestion failed: {exc}") from exc
+    db.commit()
+
+    evidence = _claim_citations(db, [c for s in suggestions for c in s["claim_ids"]])
+    return SuggestTopicsResponse(
+        episode_id=episode.id,
+        coverage_mode=episode.coverage_mode,
+        suggestions=[
+            TopicSuggestion(
+                **s, citations=[evidence[c] for c in s["claim_ids"] if c in evidence]
+            )
+            for s in suggestions
+        ],
+    )
+
+
+def _claim_citations(db: Session, claim_ids: list[str]) -> dict[str, CitationOut]:
+    """Quoted evidence for claims that are not yet attached to any stored item."""
+    parsed: list[uuid.UUID] = []
+    for value in claim_ids:
+        try:
+            parsed.append(uuid.UUID(str(value)))
+        except ValueError:
+            continue
+    if not parsed:
+        return {}
+    rows = db.execute(
+        select(Claim, Chunk, Source)
+        .join(Chunk, Claim.chunk_id == Chunk.id)
+        .join(Source, Chunk.source_id == Source.id)
+        .where(Claim.id.in_(parsed))
+    ).all()
+    return {
+        str(claim.id): CitationOut(
+            chunk_id=chunk.id,
+            source_id=source.id,
+            source_title=source.title,
+            source_url=source.url,
+            quote=chunk.text[claim.span_start : claim.span_end],
+            start_ms=chunk.start_ms,
+            end_ms=chunk.end_ms,
+        )
+        for claim, chunk, source in rows
+    }
+
+
 # --------------------------------------------------------------------------
 # script
 # --------------------------------------------------------------------------
@@ -482,6 +568,7 @@ def create_script(
         style_preset=body.style_preset,
         voice_sample_ref=voice_ref,
         model_version=get_llm().version,
+        duration_minutes=body.duration_minutes,
     )
     db.add(script)
     db.flush()
@@ -491,7 +578,11 @@ def create_script(
         kind="generate_script",
         episode_id=episode.id,
         user_id=user.id,
-        payload={"script_id": str(script.id)},
+        payload={
+            "script_id": str(script.id),
+            "optimize_order": body.optimize_order,
+            "include_bonus": body.include_bonus,
+        },
         idempotency_key=f"script:{script.id}",
     )
     db.commit()
@@ -530,22 +621,32 @@ def _script_out(db: Session, script: Script) -> ScriptResponse:
         episode_id=script.episode_id,
         style_preset=script.style_preset,
         model_version=script.model_version,
+        duration_minutes=script.duration_minutes,
         created_at=script.created_at,
-        segments=[
-            SegmentOut(
-                id=s.id,
-                ordinal=s.ordinal,
-                topic_id=s.topic_id,
-                question=s.question,
-                rationale=s.rationale,
-                expected_direction=s.expected_direction,
-                followups=s.followups,
-                risk_flags=s.risk_flags,
-                edited_by_user=s.edited_by_user,
-                citations=citations.get(s.id, []),
-            )
-            for s in segments
-        ],
+        segments=[_segment_out(s, citations.get(s.id, [])) for s in segments],
+    )
+
+
+def _segment_out(segment: ScriptSegment, citations: list[CitationOut]) -> SegmentOut:
+    return SegmentOut(
+        id=segment.id,
+        ordinal=segment.ordinal,
+        segment_type=segment.segment_type,
+        title=segment.title,
+        start_minute=segment.start_minute,
+        planned_minutes=segment.planned_minutes,
+        topic_id=segment.topic_id,
+        transition_in=segment.transition_in,
+        host_script=segment.host_script,
+        question=segment.question,
+        deeper_questions=segment.deeper_questions,
+        rationale=segment.rationale,
+        expected_direction=segment.expected_direction,
+        followups=segment.followups,
+        risk_flags=segment.risk_flags,
+        flagged_unsourced=segment.flagged_unsourced,
+        edited_by_user=segment.edited_by_user,
+        citations=citations,
     )
 
 
@@ -571,15 +672,4 @@ def patch_segment(
     db.commit()
 
     citations = _citations_for(db, "script_segment", [segment.id])
-    return SegmentOut(
-        id=segment.id,
-        ordinal=segment.ordinal,
-        topic_id=segment.topic_id,
-        question=segment.question,
-        rationale=segment.rationale,
-        expected_direction=segment.expected_direction,
-        followups=segment.followups,
-        risk_flags=segment.risk_flags,
-        edited_by_user=segment.edited_by_user,
-        citations=citations.get(segment.id, []),
-    )
+    return _segment_out(segment, citations.get(segment.id, []))
