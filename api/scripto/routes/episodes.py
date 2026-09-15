@@ -460,8 +460,10 @@ def set_topics(
     db.add_all(topics)
     db.flush()
 
-    # Topics arriving after a thin verdict are what unlock topic research.
-    if episode.coverage_mode in ("thin", "sparse") and episode.topic_entity_id is None:
+    # New topics get researched. Once coverage has run, a check starts that now;
+    # before that, the first coverage check picks them up. Topics researched
+    # before cost nothing to save again.
+    if episode.coverage_mode is not None:
         queue.enqueue(
             db,
             kind="coverage_check",

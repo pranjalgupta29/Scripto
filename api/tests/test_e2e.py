@@ -669,3 +669,98 @@ def test_regenerate_with_a_note_revises_the_current_version(auth_client, monkeyp
     assert second["parent_script_id"] == first_id
     assert note in prompts[-1], "the host's note never reached the model"
     assert "Current version of this run-of-show" in prompts[-1]
+
+
+def _stub_article_fetch(monkeypatch):
+    from scripto.adapters.web_article import WebArticleAdapter
+
+    monkeypatch.setattr(WebArticleAdapter, "fetch", lambda self, url: _article_html(url))
+
+
+def _record_searches(monkeypatch) -> list[str]:
+    from scripto.search import FakeSearchProvider
+
+    queries: list[str] = []
+    original = FakeSearchProvider.search
+
+    def recording(self, query, *, limit=10):
+        queries.append(query)
+        return original(self, query, limit=limit)
+
+    monkeypatch.setattr(FakeSearchProvider, "search", recording)
+    return queries
+
+
+def test_well_covered_guests_also_get_a_topic_brief(auth_client, db, monkeypatch):
+    """The host's call: topic research runs for every episode, not only thin ones."""
+    import scripto.pipeline.coverage as coverage
+    from scripto.config import settings
+
+    monkeypatch.setattr(settings, "max_sources_per_episode", 3)
+    monkeypatch.setattr(coverage, "_mode", lambda *args: "rich")
+    _stub_article_fetch(monkeypatch)
+    queries = _record_searches(monkeypatch)
+
+    episode_id = _episode_with_guest(auth_client)
+    auth_client.post(f"/episodes/{episode_id}/topics", json={"topics": HOST_TOPICS})
+    drain()
+
+    episode = db.get(Episode, uuid.UUID(episode_id))
+    db.refresh(episode)
+    assert episode.coverage_mode == "rich"
+    assert any("Private credit" in q for q in queries), "topics were not researched"
+    dossier = auth_client.get(f"/episodes/{episode_id}/dossier").json()
+    assert "topic_brief" in {s["section"] for s in dossier["sections"]}
+
+
+def test_editing_topics_researches_only_the_new_ones(auth_client, db, monkeypatch):
+    from scripto.config import settings
+    from scripto.models import Entity
+
+    monkeypatch.setattr(settings, "max_sources_per_episode", 3)
+    _stub_article_fetch(monkeypatch)
+    queries = _record_searches(monkeypatch)
+
+    episode_id = _episode_with_guest(auth_client)
+    auth_client.post(f"/episodes/{episode_id}/topics", json={"topics": HOST_TOPICS})
+    drain()
+    first_round = len(queries)
+
+    # Swap one topic: only the new one should be searched.
+    edited = ["Private credit", "Liquidity risk", "Pension fund exposure"]
+    auth_client.post(f"/episodes/{episode_id}/topics", json={"topics": edited})
+    drain()
+    second_round = queries[first_round:]
+
+    assert any("Pension fund exposure" in q for q in second_round)
+    assert not any("Private credit" in q or "Liquidity risk" in q for q in second_round)
+
+    episode = db.get(Episode, uuid.UUID(episode_id))
+    db.refresh(episode)
+    topic = db.get(Entity, episode.topic_entity_id)
+    assert set(topic.external_ids["researched_topics"]) == set(HOST_TOPICS) | {"Pension fund exposure"}
+    assert topic.aliases == edited
+
+    # Saving the same topics again costs no searches at all.
+    before = len(queries)
+    auth_client.post(f"/episodes/{episode_id}/topics", json={"topics": edited})
+    drain()
+    assert len(queries) == before
+
+
+def test_topic_research_gives_every_topic_its_share(auth_client, monkeypatch):
+    """One shared allowance let the first topic's searches fill every slot."""
+    from scripto.config import settings
+
+    monkeypatch.setattr(settings, "max_sources_per_episode", 3)
+    _stub_article_fetch(monkeypatch)
+    _record_searches(monkeypatch)
+
+    episode_id = _episode_with_guest(auth_client)
+    auth_client.post(f"/episodes/{episode_id}/topics", json={"topics": HOST_TOPICS})
+    drain()
+
+    listed = auth_client.get(f"/episodes/{episode_id}").json()["sources"]
+    topic_urls = " ".join(s["url"] or "" for s in listed if s["subject"] == "topic")
+    for slug in ("private-credit", "liquidity-risk", "regulation"):
+        assert slug in topic_urls, f"no source was researched for {slug}"

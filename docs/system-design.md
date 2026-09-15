@@ -61,7 +61,8 @@ topic ideation (the user supplies topics), no billing.
 **Scope change (2026-09-14).** Topic ideation was a v1 non-goal. The host asked
 for it, so Scripto now suggests topics, each labelled as backed by research or
 taken from the episode title alone (§5.10). The script also grew from one
-question per topic into a timed run-of-show.
+question per topic into a timed run-of-show. Topic research and the topic brief
+now cover every episode with topics, not only thin and sparse guests (§10).
 
 ---
 
@@ -440,7 +441,10 @@ episodes) the topic entity named in the job payload.
   `"{name}" blog OR substack OR essay` · `"{name}" bio {employer}` · and, when an
   employer is known, `"{name}" {employer} earnings call OR 10-K OR filing`.
 - **Topic queries:** `{topic} explained` and `{topic} latest research` for each
-  of the host's topics, at most 8 searches.
+  new topic. The source allowance is split evenly across topics (3, 3 and 2 for a
+  limit of 8 and three topics). A shared allowance let the first topic's results
+  fill every slot: a real run found 8 articles on focus and none on supplements
+  or sleep.
 - Every search is charged to the search budget and paced on its own. Until
   2026-09-15 the whole run counted as one charge, so the budget undercounted by
   about 7×.
@@ -578,8 +582,8 @@ episodes) the topic entity named in the job payload.
 - "Rich" used to need a fixed 8 readable sources while discovery fetched 8, so a
   single failed download ruled it out. That is why Satya Nadella and Andrew
   Huberman were both first labelled "thin".
-- For thin and sparse episodes that have topics, it creates a topic entity and
-  starts topic research (§10).
+- For every episode with topics, it starts research on any topic not
+  researched before (§10).
 - Enqueues `build_dossier`, keyed on the mode and the claim counts for both the
   guest and the topic, so new claims always trigger a rebuild.
 - Each discovery run gets its own check (key `coverage:{episode}:{discover job}`).
@@ -599,7 +603,7 @@ episodes) the topic entity named in the job payload.
 | public_positions | `opinion` and `prediction`, oldest first, so shifts over time show |
 | already_covered | claims in clusters with `source_count ≥ 3` |
 | unexplored_angles | `fact`, `opinion` and `anecdote`, least-covered clusters first |
-| topic_brief | the topic entity's `fact`, `opinion` and `prediction` claims, newest first (thin/sparse only; §10) |
+| topic_brief | the topic entity's `fact`, `opinion` and `prediction` claims, newest first (every episode whose topics were researched; §10) |
 
 - **Verification.** An item survives only if at least one of its `claim_ids` is
   in the set of claims actually given to the model. A made-up id counts the same
@@ -987,22 +991,25 @@ full one.
 system. It creates a `topic` entity, runs the same discover, fetch, chunk,
 extract and cluster pipeline against it, and uses a different composer.
 
-**How it runs (since 2026-09-15).** Once the coverage check finds a thin or
-sparse guest and the host has saved topics, it creates a topic entity whose
-aliases are the host's topics, and enqueues `discover` with `{"entity_id":
-<topic>, "mode": "topic"}`. Discovery searches for the topics (§5.2), and the
-subject id travels with each source through fetch and parse, so extraction
-attributes the claims to the topic. The topic run's own coverage check then
-rebuilds the dossier with a `topic_brief` section. Saving topics mid-ingestion
-is fine: it only decides when topic research starts.
+**How it runs.** Each episode has one topic entity whose aliases are the host's
+current topics, and it records which topics have been researched
+(`external_ids.researched_topics`). The coverage check, and saving topics once
+coverage has run, enqueue `discover` with `{"entity_id": <topic>, "mode": "topic",
+"topics": [only the new ones]}`. Discovery searches for those topics (§5.2), and
+the subject id travels with each source through fetch and parse, so extraction
+attributes the claims to the topic. That run's own coverage check then rebuilds
+the dossier with a `topic_brief` section. Editing topics costs a search round for
+the new ones only; saving the same topics again costs nothing.
 
 **Before that fix,** topic discovery ignored its payload and searched for the
 guest again, so the topic entity never got any claims. In one real episode it
 added two more Huberman interviews instead of topic material.
 
-**Who gets a topic brief.** Per the spec, only thin and sparse guests. Well-covered
-guests get none, even when the host has chosen specific topics. Whether to change
-that is an open decision (§17).
+**Who gets a topic brief.** Every episode whose topics were researched, whatever
+the guest's coverage. The spec limited it to thin and sparse guests; the host
+changed that on 2026-09-15 because background on the chosen topics helps with any
+guest. The cost is up to 8 more searches and roughly 60 more Gemini calls per
+episode, about 5 minutes on the free tier.
 
 **Calibration.** Real runs labelled Satya Nadella and Andrew Huberman "thin". The
 cause was a fixed "rich" threshold of 8 readable sources against a source limit of
@@ -1032,7 +1039,7 @@ probed).
 | POST | `/episodes/{id}/sources` | Add a URL (fetched) or pasted text (parsed directly) | enqueues |
 | DELETE | `/episodes/{id}/sources/{sid}` | Soft-remove from this episode only | sync |
 | GET | `/episodes/{id}/dossier` | Sections, items and citations with quoted text | sync |
-| POST | `/episodes/{id}/topics` | Set 3–6 topics | sync |
+| POST | `/episodes/{id}/topics` | Set 3–6 topics; once coverage has run, starts research on any new topic | sync |
 | GET | `/episodes/{id}/topics` | The saved topics | sync |
 | POST | `/episodes/{id}/topics/suggest` | Topic suggestions from the title and research, each labelled research or title-only | sync (inline) |
 | POST | `/episodes/{id}/script` | Style, length (10–240 min), topic-order option, backup topics on/off, optional voice sample, optional feedback note (revises the latest version) | enqueues (202) |
@@ -1058,7 +1065,8 @@ probed).
 
 **Polling.** The episode view refetches every 2 s while jobs are pending or the
 status is `ingesting`. The dossier view refetches every 3 s until it has
-sections, and the script view every 2.5 s until it has segments. Each stops
+sections, and for as long as research is running, so a topic brief that lands
+later appears without a reload, and the script view every 2.5 s until it has segments. Each stops
 once it has what it needs.
 
 **Flow.** The identity step calls identify automatically when the page opens and
@@ -1125,12 +1133,12 @@ the same code can be deployed unchanged.
 
 ## 14. Testing, provider checks and evals
 
-### Tests — `api/tests/`, 83 of them
+### Tests — `api/tests/`, 86 of them
 
 | File | What it covers |
 |---|---|
 | `test_units.py` | Span and quote guards, fabricated quotes being rejected, chunk offsets resolving, URL canonicalisation, YouTube ids, idempotency, fair dequeue, lease recovery, backoff until dead, run-of-show timing, claim ids kept out of script text, rescheduling without burning an attempt, coverage labels relative to the source limit, what counts as long-form |
-| `test_e2e.py` | A full run through export, the §9 acceptance criteria (failed sources degrade but never fail the run, thin/sparse labelling, reparse with no network, repeated-story clustering, global source dedupe, per-episode removal), the dossier rebuild regression, access control, topic suggestions, the timed run-of-show, host topic order, question count by length, progress by sources, topic research, host sources never blocked, regenerating that keeps edits and passes notes, one budget charge per search, topic sources excluded from the guest's label |
+| `test_e2e.py` | A full run through export, the §9 acceptance criteria (failed sources degrade but never fail the run, thin/sparse labelling, reparse with no network, repeated-story clustering, global source dedupe, per-episode removal), the dossier rebuild regression, access control, topic suggestions, the timed run-of-show, host topic order, question count by length, progress by sources, topic research, host sources never blocked, regenerating that keeps edits and passes notes, one budget charge per search, topic sources excluded from the guest's label, topic briefs for well-covered guests, researching only newly added topics, every topic getting its share of sources |
 | `test_budget.py` | Budget refusal, disabling a provider, unlimited budgets, a concurrency race against the budget, pacing, pacing shared across workers |
 
 - Tests run against **real Postgres** (the `scripto_test` database) and the
@@ -1218,6 +1226,8 @@ concurrency were involved.
 | Two of the most-covered people alive were labelled "thin" | "Rich" needed 8 readable sources while discovery fetched 8, so one failed download ruled it out | "Rich" needs 75% of the source limit readable | Tests fetch 25 sources |
 | Topic articles counted as the guest's sources (16 instead of 9) | Coverage counted every source on the episode | Each attachment records its subject; only the guest's count | Needed topic research to find real topic sources first |
 | A Wikipedia page counted as a long-form appearance | "Long-form" meant any long page | It now means a video, or a long interview, podcast, talk or transcript | The fakes' pages are short |
+| A three-topic brief covered only the first topic | One source allowance was shared across topics, and the first topic's searches filled it | The allowance is split evenly across topics | No test checked which topics got sources |
+| A dossier rebuild set a scripted episode back to "dossier ready" | The builder always set that status | It leaves "script ready" alone | Tests never rebuilt after a script |
 | After a restart, every database call failed | Settings found `.env` relative to the working directory. Started from `web/`, the API and worker fell back to a default that pointed at the other Postgres on port 5432 | `.env` and blob storage are located relative to the code, and `DATABASE_URL` is now required | Tests always run from `api/` |
 
 Found while building, before real providers:
@@ -1278,9 +1288,9 @@ In rough priority order:
     first real run two suggestions showed the same quote, and one did not really
     support its topic. A title-only suggestion can still state an unsourced fact
     in its explanation.
-20. **Well-covered guests get no topic brief,** even when the host chose specific
-    topics (§10). Open decision: always research the host's topics, or add a
-    "Research my topics" button.
+20. **Removed topics linger in the topic brief's material.** Claims from a topic
+    the host removed stay on the topic entity and can still surface in the
+    brief. Claims do not record which topic's search found them.
 
 ---
 

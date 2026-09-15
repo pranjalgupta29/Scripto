@@ -170,9 +170,9 @@ def run_build_dossier(db: Session, job: Job) -> None:
     for section in SECTIONS:
         compose_section(db, episode, subject, section)
 
-    # Thin and sparse episodes get a topic brief built from the topic entity,
-    # through the very same composer.
-    if episode.topic_entity_id and episode.coverage_mode in ("thin", "sparse"):
+    # Every episode whose topics were researched gets a topic brief, through the
+    # very same composer. (The spec limited this to thin and sparse guests.)
+    if episode.topic_entity_id:
         topic_entity = db.get(Entity, episode.topic_entity_id)
         if topic_entity is not None:
             compose_section(db, episode, topic_entity, "topic_brief")
@@ -192,5 +192,7 @@ def run_build_dossier(db: Session, job: Job) -> None:
             f"composed 0 dossier items from {claim_total} claims for episode {episode.id}"
         )
 
-    episode.status = "dossier_ready"
+    # A rebuild must not move an episode that already has a script back a step.
+    if episode.status != "script_ready":
+        episode.status = "dossier_ready"
     db.flush()

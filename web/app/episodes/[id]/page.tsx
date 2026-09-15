@@ -94,7 +94,10 @@ export default function EpisodePage() {
             detail={data.coverage_detail}
           />
           <SourcesPanel episodeId={id} sources={data.sources} />
-          <DossierPanel episodeId={id} />
+          <DossierPanel
+            episodeId={id}
+            busy={(data.progress?.pending ?? 0) > 0}
+          />
           <TopicsPanel episodeId={id} />
           <ScriptPanel episodeId={id} />
         </>
@@ -364,12 +367,20 @@ function SourcesPanel({
 /* 3. dossier                                                          */
 /* ------------------------------------------------------------------ */
 
-function DossierPanel({ episodeId }: { episodeId: string }) {
+function DossierPanel({
+  episodeId,
+  busy,
+}: {
+  episodeId: string;
+  busy: boolean;
+}) {
   const dossier = useQuery({
     queryKey: ["dossier", episodeId],
     queryFn: () => api.getDossier(episodeId),
+    // Keep refreshing while research runs, so a topic brief or rebuild that
+    // lands after the first dossier shows up without a reload.
     refetchInterval: (query) =>
-      query.state.data?.sections.length ? false : 3000,
+      busy || !query.state.data?.sections.length ? 3000 : false,
   });
 
   if (!dossier.data?.sections.length) {

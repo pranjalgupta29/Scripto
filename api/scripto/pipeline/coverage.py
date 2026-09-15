@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import uuid
 
+import hashlib
 import math
 
 from sqlalchemy import func, or_, select
@@ -202,10 +203,9 @@ def run_coverage(db: Session, job: Job) -> None:
     episode.coverage_detail = {**(episode.coverage_detail or {}), **detail}
     db.flush()
 
-    # Thin and sparse guests lean on topic material, so research the topics the
-    # user gave us through the same pipeline.
-    if detail["mode"] in ("thin", "sparse"):
-        _kick_topic_research(db, episode, job)
+    # Research the host's topics for every episode, not only thin and sparse
+    # guests (the host's call). Only topics not researched before cost anything.
+    _kick_topic_research(db, episode, job)
 
     # The idempotency key must change when the inputs change, otherwise the
     # first build wins forever -- including a build that ran before extraction
@@ -239,35 +239,50 @@ def _topic_claim_count(db: Session, episode: Episode) -> int:
 
 
 def _kick_topic_research(db: Session, episode: Episode, job: Job) -> None:
-    """Create a topic entity and run the same discover pipeline against it."""
-    if episode.topic_entity_id is not None:
+    """Research the host's topics through the same pipeline, once per topic.
+
+    Every episode with topics gets this -- the host's call on 2026-09-15; the
+    spec had limited it to thin and sparse guests. One topic entity per episode
+    holds the current topics, and only topics not researched before trigger new
+    searches, so editing topics costs a search round for the new ones only.
+    """
+    topics = [
+        t.text
+        for t in db.scalars(
+            select(Topic).where(Topic.episode_id == episode.id).order_by(Topic.ordinal)
+        )
+    ]
+    if not topics:
+        return  # no topics yet; this runs again when the host saves some
+
+    entity = db.get(Entity, episode.topic_entity_id) if episode.topic_entity_id else None
+    if entity is None:
+        entity = Entity(id=uuid.uuid4(), type="topic", name="", aliases=[], external_ids={})
+        db.add(entity)
+        db.flush()
+        episode.topic_entity_id = entity.id
+
+    researched = list((entity.external_ids or {}).get("researched_topics", []))
+    new_topics = [t for t in topics if t not in researched]
+
+    entity.name = "; ".join(topics[:3])
+    entity.aliases = topics
+    if not new_topics:
+        db.flush()
         return
 
-    topics = list(
-        db.scalars(select(Topic).where(Topic.episode_id == episode.id).order_by(Topic.ordinal))
-    )
-    if not topics:
-        return  # the user has not entered topics yet; rerun when they do
-
-    label = "; ".join(t.text for t in topics[:3])
-    entity = Entity(
-        id=uuid.uuid4(),
-        type="topic",
-        name=label,
-        aliases=[t.text for t in topics],
-        external_ids={},
-    )
-    db.add(entity)
+    entity.external_ids = {
+        **(entity.external_ids or {}),
+        "researched_topics": researched + new_topics,
+    }
     db.flush()
 
-    episode.topic_entity_id = entity.id
-    db.flush()
-
+    digest = hashlib.sha256("|".join(sorted(new_topics)).encode()).hexdigest()[:16]
     queue.enqueue(
         db,
         kind="discover",
         episode_id=episode.id,
         user_id=job.user_id,
-        payload={"entity_id": str(entity.id), "mode": "topic"},
-        idempotency_key=f"discover-topic:{episode.id}",
+        payload={"entity_id": str(entity.id), "mode": "topic", "topics": new_topics},
+        idempotency_key=f"discover-topic:{episode.id}:{digest}",
     )

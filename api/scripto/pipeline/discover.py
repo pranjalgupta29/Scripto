@@ -91,9 +91,12 @@ MAX_TOPICS_RESEARCHED = 6
 MAX_TOPIC_QUERIES = 8
 
 
-def topic_query_patterns(entity: Entity) -> list[str]:
-    """Searches for a topic brief: the subject matter, not the guest."""
-    topics = [t for t in (entity.aliases or []) if t] or [entity.name]
+def topic_query_patterns(entity: Entity, topics: list[str] | None = None) -> list[str]:
+    """Searches for a topic brief: the subject matter, not the guest.
+
+    `topics` narrows a run to newly added topics; otherwise all of them.
+    """
+    topics = topics or [t for t in (entity.aliases or []) if t] or [entity.name]
     patterns: list[str] = []
     for topic in topics[:MAX_TOPICS_RESEARCHED]:
         patterns.append(f"{topic} explained")
@@ -115,39 +118,60 @@ def run_discover(db: Session, job: Job) -> None:
     if entity is None:
         return
 
-    patterns = topic_query_patterns(entity) if topic_mode else query_patterns(entity)
+    if topic_mode:
+        topics = (
+            job.payload.get("topics") or [t for t in (entity.aliases or []) if t] or [entity.name]
+        )[:MAX_TOPICS_RESEARCHED]
+        # Split the allowance across topics. One shared allowance let the first
+        # topic's searches fill every slot: a real run found 8 articles on focus
+        # and none on supplements or sleep.
+        base, extra = divmod(settings.max_sources_per_episode, len(topics))
+        buckets = [
+            (topic_query_patterns(entity, [topic]), base + (1 if i < extra else 0))
+            for i, topic in enumerate(topics)
+        ]
+    else:
+        buckets = [(query_patterns(entity), settings.max_sources_per_episode)]
+
     search = get_search()
     seen: set[str] = set()
     attached: list[Source] = []
+    out_of_budget = False
 
-    # The cap is this run's allowance: guest research and topic research each
-    # get their own, and neither counts sources the host adds by hand.
-    for pattern in patterns:
-        if len(attached) >= settings.max_sources_per_episode:
-            break
-        try:
-            # One slot per search, so budgets and pacing count real calls.
-            # This used to wrap the whole loop and charged ~7 searches as one.
-            with provider_slot("search"):
-                results = search.search(pattern, limit=6)
-        except BudgetExceeded:
-            break  # out of search budget: keep what was found so far
-        except SlotUnavailable:
-            raise  # provider busy: retry the whole run later
-        except Exception:
-            continue  # one bad query never fails discovery
-        for r in results:
-            canonical = canonicalize_url(r.url)
-            if not canonical or canonical in seen:
-                continue
-            seen.add(canonical)
-            source = attach_source(
-                db, episode=episode, url=r.url, title=r.title, subject_entity_id=entity.id
-            )
-            if source is not None:
-                attached.append(source)
-            if len(attached) >= settings.max_sources_per_episode:
+    # Each bucket's allowance caps what it may attach. Guest research and topic
+    # research each get the full limit, and neither counts sources the host
+    # adds by hand.
+    for bucket_patterns, allowance in buckets:
+        found = 0
+        for pattern in bucket_patterns:
+            if found >= allowance:
                 break
+            try:
+                # One slot per search, so budgets and pacing count real calls.
+                with provider_slot("search"):
+                    results = search.search(pattern, limit=6)
+            except BudgetExceeded:
+                out_of_budget = True  # keep what was found so far
+                break
+            except SlotUnavailable:
+                raise  # provider busy: retry the whole run later
+            except Exception:
+                continue  # one bad query never fails discovery
+            for r in results:
+                canonical = canonicalize_url(r.url)
+                if not canonical or canonical in seen:
+                    continue
+                seen.add(canonical)
+                source = attach_source(
+                    db, episode=episode, url=r.url, title=r.title, subject_entity_id=entity.id
+                )
+                if source is not None:
+                    attached.append(source)
+                    found += 1
+                if found >= allowance:
+                    break
+        if out_of_budget:
+            break
 
     for source in attached:
         payload = {"source_id": str(source.id), "subject_entity_id": str(entity.id)}
