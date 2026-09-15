@@ -265,7 +265,9 @@ def _kick_topic_research(db: Session, episode: Episode, job: Job) -> None:
     researched = list((entity.external_ids or {}).get("researched_topics", []))
     new_topics = [t for t in topics if t not in researched]
 
-    entity.name = "; ".join(topics[:3])
+    # Only a fallback label: each topic source is read against its own topic.
+    # This once named just the first three topics and was used for every source.
+    entity.name = "; ".join(topics)[:255]
     entity.aliases = topics
     if not new_topics:
         db.flush()

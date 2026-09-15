@@ -764,3 +764,91 @@ def test_topic_research_gives_every_topic_its_share(auth_client, monkeypatch):
     topic_urls = " ".join(s["url"] or "" for s in listed if s["subject"] == "topic")
     for slug in ("private-credit", "liquidity-risk", "regulation"):
         assert slug in topic_urls, f"no source was researched for {slug}"
+
+
+def test_topic_sources_are_read_against_their_own_topic(auth_client, db, monkeypatch):
+    """Later topics' pages were read against a label naming only the first three."""
+    import scripto.pipeline.extract as extract
+    from scripto.config import settings
+    from scripto.models import EpisodeSource
+
+    monkeypatch.setattr(settings, "max_sources_per_episode", 3)
+    _stub_article_fetch(monkeypatch)
+    subjects: list[str] = []
+    original = extract.extract_from_chunk
+
+    def recording(chunk, subject_name):
+        subjects.append(subject_name)
+        return original(chunk, subject_name)
+
+    monkeypatch.setattr(extract, "extract_from_chunk", recording)
+
+    episode_id = _episode_with_guest(auth_client)
+    auth_client.post(f"/episodes/{episode_id}/topics", json={"topics": HOST_TOPICS})
+    drain()
+
+    for topic in HOST_TOPICS:
+        assert topic in subjects, f"no source was read against {topic!r}"
+    labels = db.scalars(
+        select(EpisodeSource.topic).where(
+            EpisodeSource.episode_id == uuid.UUID(episode_id),
+            EpisodeSource.topic.is_not(None),
+        )
+    ).all()
+    assert set(labels) == set(HOST_TOPICS)
+    listed = auth_client.get(f"/episodes/{episode_id}").json()["sources"]
+    assert {s["topic"] for s in listed if s["subject"] == "topic"} == set(HOST_TOPICS)
+
+
+def test_topic_brief_offers_every_topic_a_share(auth_client, monkeypatch):
+    """Newest-first let the first topic fill the brief: 44 of 60 claims on one topic."""
+    import scripto.pipeline.dossier as dossier
+    from scripto.config import settings
+
+    monkeypatch.setattr(settings, "max_sources_per_episode", 6)
+    monkeypatch.setattr(dossier, "MAX_CLAIMS_PER_SECTION", 6)
+    _stub_article_fetch(monkeypatch)
+    prompts: list[str] = []
+    original = dossier.dossier_prompt
+
+    def recording(*args, **kwargs):
+        prompt = original(*args, **kwargs)
+        prompts.append(prompt)
+        return prompt
+
+    monkeypatch.setattr(dossier, "dossier_prompt", recording)
+
+    episode_id = _episode_with_guest(auth_client)
+    auth_client.post(f"/episodes/{episode_id}/topics", json={"topics": HOST_TOPICS})
+    drain()
+
+    brief = next(p for p in reversed(prompts) if "Section: topic_brief" in p)
+    offered = {
+        block.splitlines()[0]: sum(line.startswith("[") for line in block.splitlines())
+        for block in brief.split("\nTopic: ")[1:]
+    }
+    assert offered == {topic: 2 for topic in HOST_TOPICS}
+
+
+def test_a_topic_with_nothing_sourced_is_reported(auth_client, monkeypatch):
+    """A topic that yields no claims is named, not quietly left out of the brief."""
+    import scripto.pipeline.extract as extract
+    from scripto.config import settings
+
+    monkeypatch.setattr(settings, "max_sources_per_episode", 3)
+    _stub_article_fetch(monkeypatch)
+    original = extract.extract_from_chunk
+    monkeypatch.setattr(
+        extract,
+        "extract_from_chunk",
+        lambda chunk, subject_name: (
+            [] if subject_name == "Regulation" else original(chunk, subject_name)
+        ),
+    )
+
+    episode_id = _episode_with_guest(auth_client)
+    auth_client.post(f"/episodes/{episode_id}/topics", json={"topics": HOST_TOPICS})
+    drain()
+
+    dossier = auth_client.get(f"/episodes/{episode_id}/dossier").json()
+    assert dossier["coverage_detail"]["topic_gaps"] == ["Regulation"]

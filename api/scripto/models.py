@@ -187,6 +187,9 @@ class EpisodeSource(Base):
     subject_entity_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("entities.id", ondelete="SET NULL")
     )
+    # For topic research: the host topic this source was found for. Extraction
+    # reads the source against it, and the topic brief gives each topic a share.
+    topic: Mapped[str | None] = mapped_column(String(500))
     removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False

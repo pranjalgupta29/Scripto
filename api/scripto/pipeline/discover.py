@@ -46,6 +46,7 @@ def attach_source(
     added_by: str = "system",
     title: str | None = None,
     subject_entity_id: uuid.UUID | None = None,
+    topic: str | None = None,
 ) -> Source | None:
     """Attach a URL to an episode, reusing the global source row if it exists."""
     canonical = canonicalize_url(url)
@@ -78,6 +79,7 @@ def attach_source(
                 source_id=source.id,
                 added_by=added_by,
                 subject_entity_id=subject_entity_id,
+                topic=topic[:500] if topic else None,
             )
         )
     elif link.removed_at is not None and added_by == "user":
@@ -126,12 +128,14 @@ def run_discover(db: Session, job: Job) -> None:
         # topic's searches fill every slot: a real run found 8 articles on focus
         # and none on supplements or sleep.
         base, extra = divmod(settings.max_sources_per_episode, len(topics))
+        # Each source remembers the topic it was found for: extraction reads it
+        # against that topic, and the topic brief gives every topic its share.
         buckets = [
-            (topic_query_patterns(entity, [topic]), base + (1 if i < extra else 0))
+            (topic, topic_query_patterns(entity, [topic]), base + (1 if i < extra else 0))
             for i, topic in enumerate(topics)
         ]
     else:
-        buckets = [(query_patterns(entity), settings.max_sources_per_episode)]
+        buckets = [(None, query_patterns(entity), settings.max_sources_per_episode)]
 
     search = get_search()
     seen: set[str] = set()
@@ -141,7 +145,7 @@ def run_discover(db: Session, job: Job) -> None:
     # Each bucket's allowance caps what it may attach. Guest research and topic
     # research each get the full limit, and neither counts sources the host
     # adds by hand.
-    for bucket_patterns, allowance in buckets:
+    for topic, bucket_patterns, allowance in buckets:
         found = 0
         for pattern in bucket_patterns:
             if found >= allowance:
@@ -163,7 +167,12 @@ def run_discover(db: Session, job: Job) -> None:
                     continue
                 seen.add(canonical)
                 source = attach_source(
-                    db, episode=episode, url=r.url, title=r.title, subject_entity_id=entity.id
+                    db,
+                    episode=episode,
+                    url=r.url,
+                    title=r.title,
+                    subject_entity_id=entity.id,
+                    topic=topic,
                 )
                 if source is not None:
                     attached.append(source)

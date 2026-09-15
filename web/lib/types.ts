@@ -27,6 +27,7 @@ export interface SourceOut {
   error: string | null;
   added_by: string;
   subject: "guest" | "topic";
+  topic: string | null;
 }
 
 export interface JobProgress {
@@ -51,6 +52,7 @@ export interface CoverageDetail {
   has_long_form?: boolean;
   missing?: string[];
   date_span?: { first: string | null; last: string | null };
+  topic_gaps?: string[];
 }
 
 export interface Episode {

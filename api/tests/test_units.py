@@ -339,3 +339,12 @@ def test_long_form_means_an_appearance_not_just_a_long_page(
 
     source = Source(title=title, url=url, type=source_type)
     assert is_long_form(source, chars) is expected
+
+
+def test_interleave_takes_turns_and_stops_at_the_limit():
+    """The topic brief takes one claim per topic in turn, so none fills the list."""
+    from scripto.pipeline.dossier import _interleave
+
+    assert _interleave([[1, 2, 3], ["a"], [10, 20]]) == [1, "a", 10, 2, 20, 3]
+    assert _interleave([[1, 2, 3], ["a"]], limit=3) == [1, "a", 2]
+    assert _interleave([]) == []

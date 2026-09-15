@@ -231,7 +231,7 @@ function SourcesPanel({
   sources,
 }: {
   episodeId: string;
-  sources: { id: string; title: string | null; url: string | null; status: string; error: string | null; added_by: string; type: string; subject?: string }[];
+  sources: { id: string; title: string | null; url: string | null; status: string; error: string | null; added_by: string; type: string; subject?: string; topic?: string | null }[];
 }) {
   const queryClient = useQueryClient();
   const [url, setUrl] = useState("");
@@ -298,10 +298,14 @@ function SourcesPanel({
             </div>
             {source.subject === "topic" ? (
               <span
-                className="shrink-0 rounded border border-sky-200 bg-sky-50 px-1.5 py-0.5 text-[11px] text-sky-800"
-                title="Found for the topic brief, not about the guest"
+                className="max-w-[16rem] shrink-0 truncate rounded border border-sky-200 bg-sky-50 px-1.5 py-0.5 text-[11px] text-sky-800"
+                title={
+                  source.topic
+                    ? `Found for the topic "${source.topic}", not about the guest`
+                    : "Found for the topic brief, not about the guest"
+                }
               >
-                topic research
+                {source.topic ? `topic: ${source.topic}` : "topic research"}
               </span>
             ) : null}
             <StatusPill status={source.status} />
@@ -394,6 +398,11 @@ function DossierPanel({
     );
   }
 
+  // Topics researched without finding anything usable, shown so the brief
+  // never quietly skips one.
+  const gaps = dossier.data.coverage_detail?.topic_gaps ?? [];
+  const hasBrief = dossier.data.sections.some((s) => s.section === "topic_brief");
+
   return (
     <Card>
       <h2 className="text-sm font-semibold">Dossier</h2>
@@ -411,10 +420,31 @@ function DossierPanel({
                 </li>
               ))}
             </ul>
+            {section.section === "topic_brief" && gaps.length ? (
+              <TopicGaps gaps={gaps} />
+            ) : null}
           </section>
         ))}
+        {!hasBrief && gaps.length ? (
+          <section>
+            <h3 className="text-xs font-semibold uppercase tracking-wide text-black/45">
+              {SECTION_TITLES.topic_brief}
+            </h3>
+            <TopicGaps gaps={gaps} />
+          </section>
+        ) : null}
       </div>
     </Card>
+  );
+}
+
+function TopicGaps({ gaps }: { gaps: string[] }) {
+  return (
+    <p className="mt-3 rounded border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+      No sourced material found for: {gaps.join("; ")}. Rewording{" "}
+      {gaps.length === 1 ? "the topic" : "a topic"} and saving researches it
+      again.
+    </p>
   );
 }
 

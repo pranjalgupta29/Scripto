@@ -19,7 +19,17 @@ from scripto.jobs.limits import provider_slot
 from scripto.jobs.registry import register
 from scripto.llm import get_llm
 from scripto.llm.prompts import DOSSIER_SCHEMA, DOSSIER_SYSTEM, dossier_prompt
-from scripto.models import Chunk, Citation, Claim, ClaimCluster, DossierItem, Entity, Episode, Job
+from scripto.models import (
+    Chunk,
+    Citation,
+    Claim,
+    ClaimCluster,
+    DossierItem,
+    Entity,
+    Episode,
+    EpisodeSource,
+    Job,
+)
 
 SECTIONS = [
     "career_timeline",
@@ -54,10 +64,6 @@ def _claims_for_section(
             .where(ClaimCluster.source_count >= settings.already_covered_min_sources)
             .order_by(ClaimCluster.source_count.desc())
         )
-    elif section == "topic_brief":
-        stmt = stmt.where(Claim.kind.in_(["fact", "opinion", "prediction"])).order_by(
-            Claim.claim_date.desc().nullslast()
-        )
     else:  # unexplored_angles
         stmt = (
             stmt.outerjoin(ClaimCluster, Claim.cluster_id == ClaimCluster.id)
@@ -68,10 +74,121 @@ def _claims_for_section(
     return list(db.scalars(stmt.limit(MAX_CLAIMS_PER_SECTION)))
 
 
+# --------------------------------------------------------------------------
+# topic brief: an even share per host topic
+# --------------------------------------------------------------------------
+
+_BRIEF_KINDS = ["fact", "opinion", "prediction"]
+_RESEARCH_KINDS = ["discover", "fetch_source", "parse_source", "extract_claims"]
+
+
+def _interleave(groups: list[list], limit: int | None = None) -> list:
+    """Take one from each group in turn, so no single group fills the list."""
+    out: list = []
+    for i in range(max((len(g) for g in groups), default=0)):
+        for group in groups:
+            if i < len(group):
+                out.append(group[i])
+                if limit is not None and len(out) >= limit:
+                    return out
+    return out
+
+
+def _topic_brief_claims(
+    db: Session, episode: Episode, subject: Entity
+) -> tuple[list[Claim], dict[str, str | None]]:
+    """An even share of claims per host topic, spread across each topic's sources.
+
+    The brief used to take the newest 60 topic claims. Almost none carry a date,
+    so the first topic researched filled it: one real run offered the writer 44
+    claims on focus and none on circadian rhythms or habit extinction.
+    """
+    rows = db.execute(
+        select(Claim, EpisodeSource.topic, Chunk.source_id)
+        .join(Chunk, Claim.chunk_id == Chunk.id)
+        .join(
+            EpisodeSource,
+            (EpisodeSource.source_id == Chunk.source_id)
+            & (EpisodeSource.episode_id == episode.id),
+        )
+        .where(
+            Claim.subject_entity_id == subject.id,
+            Claim.kind.in_(_BRIEF_KINDS),
+            EpisodeSource.removed_at.is_(None),
+        )
+        .order_by(Claim.claim_date.desc().nullslast(), Chunk.ordinal, Claim.span_start)
+    ).all()
+
+    current = [t for t in (subject.aliases or []) if t]
+    by_topic: dict[str | None, dict[uuid.UUID, list[Claim]]] = {}
+    topic_of: dict[str, str | None] = {}
+    for claim, topic, source_id in rows:
+        if topic is not None and topic not in current:
+            continue  # the host has since dropped this topic
+        by_topic.setdefault(topic, {}).setdefault(source_id, []).append(claim)
+        topic_of[str(claim.id)] = topic
+
+    # Host order first; sources from before topics were recorded share a group.
+    order = [t for t in current if t in by_topic] + ([None] if None in by_topic else [])
+    per_topic = [_interleave(list(by_topic[t].values())) for t in order]
+    picked = _interleave(per_topic, limit=MAX_CLAIMS_PER_SECTION)
+    return picked, {str(c.id): topic_of[str(c.id)] for c in picked}
+
+
+def _topic_gaps(db: Session, episode: Episode, subject: Entity) -> list[str]:
+    """Researched topics that yielded nothing usable, so the host sees the gap
+    instead of a brief that quietly leaves them out."""
+    still_researching = db.scalar(
+        select(Job.id)
+        .where(
+            Job.episode_id == episode.id,
+            Job.kind.in_(_RESEARCH_KINDS),
+            Job.state.in_(["queued", "running"]),
+        )
+        .limit(1)
+    )
+    unlabelled = db.scalar(
+        select(EpisodeSource.id)
+        .where(
+            EpisodeSource.episode_id == episode.id,
+            EpisodeSource.subject_entity_id == subject.id,
+            EpisodeSource.removed_at.is_(None),
+            EpisodeSource.topic.is_(None),
+        )
+        .limit(1)
+    )
+    # Mid-research, or sources that predate topic labels: no honest answer yet.
+    if still_researching or unlabelled:
+        return []
+
+    with_claims = set(
+        db.scalars(
+            select(EpisodeSource.topic)
+            .distinct()
+            .join(Chunk, Chunk.source_id == EpisodeSource.source_id)
+            .join(Claim, Claim.chunk_id == Chunk.id)
+            .where(
+                EpisodeSource.episode_id == episode.id,
+                EpisodeSource.removed_at.is_(None),
+                Claim.subject_entity_id == subject.id,
+                Claim.kind.in_(_BRIEF_KINDS),
+            )
+        )
+    )
+    researched = set((subject.external_ids or {}).get("researched_topics", []))
+    return [t for t in (subject.aliases or []) if t in researched and t not in with_claims]
+
+
 def compose_section(
-    db: Session, episode: Episode, subject: Entity, section: str
+    db: Session,
+    episode: Episode,
+    subject: Entity,
+    section: str,
+    claims: list[Claim] | None = None,
+    topic_of: dict[str, str | None] | None = None,
 ) -> list[DossierItem]:
-    claims = _claims_for_section(db, subject.id, section)
+    if claims is None:
+        claims = _claims_for_section(db, subject.id, section)
     if not claims:
         return []
 
@@ -93,6 +210,7 @@ def compose_section(
                     )
                     for c in claims
                 ],
+                topic_of=topic_of,
             ),
             schema=DOSSIER_SCHEMA,
         )
@@ -172,10 +290,16 @@ def run_build_dossier(db: Session, job: Job) -> None:
 
     # Every episode whose topics were researched gets a topic brief, through the
     # very same composer. (The spec limited this to thin and sparse guests.)
+    gaps: list[str] = []
     if episode.topic_entity_id:
         topic_entity = db.get(Entity, episode.topic_entity_id)
         if topic_entity is not None:
-            compose_section(db, episode, topic_entity, "topic_brief")
+            claims, topic_of = _topic_brief_claims(db, episode, topic_entity)
+            compose_section(
+                db, episode, topic_entity, "topic_brief", claims=claims, topic_of=topic_of
+            )
+            gaps = _topic_gaps(db, episode, topic_entity)
+    episode.coverage_detail = {**(episode.coverage_detail or {}), "topic_gaps": gaps}
 
     produced = db.scalar(
         select(func.count(DossierItem.id)).where(DossierItem.episode_id == episode.id)

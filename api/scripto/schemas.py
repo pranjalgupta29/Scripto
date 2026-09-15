@@ -61,6 +61,8 @@ class SourceOut(BaseModel):
     added_by: str
     # Which research this source serves: "guest", or "topic" for the topic brief.
     subject: str = "guest"
+    # For topic research: the host topic this source was found for.
+    topic: str | None = None
 
     model_config = {"from_attributes": True}
 

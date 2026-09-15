@@ -351,7 +351,7 @@ erDiagram
 | `entities` | A person, company or topic | Display fields (headline, employer, photo) are frozen at identification |
 | `episodes` | One research job | `status`: identifying → ingesting → dossier_ready → script_ready. `coverage_detail` JSONB also holds the identity candidates |
 | `sources` | One fetched document, shared globally | `status`: pending, fetched, parsed, failed. `error` is shown in the UI |
-| `episode_sources` | Links episodes to sources | `added_by` is system or user; `removed_at` is a soft remove; `subject_entity_id` says whether the source serves the guest or the topic brief (NULL means the guest) |
+| `episode_sources` | Links episodes to sources | `added_by` is system or user; `removed_at` is a soft remove; `subject_entity_id` says whether the source serves the guest or the topic brief (NULL means the guest); `topic` is the host topic a topic-research source was found for |
 | `chunks` | A piece of a source, about 750 tokens | Exactly one position pair is set: character offsets for text, milliseconds for audio/video. A CHECK constraint enforces it |
 | `claims` | One atomic assertion about an entity | `kind`: biographical, opinion, fact, anecdote, prediction. `span_start`/`span_end` locate its quote inside the chunk |
 | `claim_clusters` | Groups of claims that say the same thing | `source_count` counts **distinct sources**, not claims |
@@ -433,8 +433,8 @@ flowchart TD
 
 ### 5.2 Discover — `pipeline/discover.py`
 
-A discovery run researches one subject: the guest, or (for thin and sparse
-episodes) the topic entity named in the job payload.
+A discovery run researches one subject: the guest, or (for any episode with
+topics) the topic entity named in the job payload.
 
 - **Guest queries**, 6 results each: `"{name}" {employer} news` ·
   `"{name}" interview` · `"{name}" podcast` · `"{name}" site:youtube.com` ·
@@ -445,6 +445,11 @@ episodes) the topic entity named in the job payload.
   limit of 8 and three topics). A shared allowance let the first topic's results
   fill every slot: a real run found 8 articles on focus and none on supplements
   or sleep.
+- **Each topic source records the topic it was found for** (`episode_sources.topic`).
+  Extraction reads the source against that one topic. Topic sources used to be
+  read against a label naming only the host's first three topics, so pages about
+  later topics yielded almost nothing: a Nature paper on habit extinction gave 20
+  sections and 0 claims.
 - Every search is charged to the search budget and paced on its own. Until
   2026-09-15 the whole run counted as one charge, so the budget undercounted by
   about 7×.
@@ -603,7 +608,17 @@ episodes) the topic entity named in the job payload.
 | public_positions | `opinion` and `prediction`, oldest first, so shifts over time show |
 | already_covered | claims in clusters with `source_count ≥ 3` |
 | unexplored_angles | `fact`, `opinion` and `anecdote`, least-covered clusters first |
-| topic_brief | the topic entity's `fact`, `opinion` and `prediction` claims, newest first (every episode whose topics were researched; §10) |
+| topic_brief | the topic entity's `fact`, `opinion` and `prediction` claims, an even share per host topic (every episode whose topics were researched; §10) |
+
+- **Topic brief balance.** Newest-first retrieval let the first topic researched
+  fill the brief, because almost no topic claims carry a date. A real run offered
+  the writer 44 claims on focus, 13 on sleep, 2 on supplements and none on
+  circadian rhythms or habit extinction. Claims are now taken one topic at a
+  time, and within a topic one source at a time, up to the 60 limit. The prompt
+  groups them under their topic and asks for every topic to be covered.
+- **Topic gaps.** A researched topic that yielded no usable claims is listed in
+  `coverage_detail.topic_gaps`, and the dossier panel says so instead of quietly
+  leaving it out. The list stays empty while research is still running.
 
 - **Verification.** An item survives only if at least one of its `claim_ids` is
   in the set of claims actually given to the model. A made-up id counts the same
@@ -1133,7 +1148,7 @@ the same code can be deployed unchanged.
 
 ## 14. Testing, provider checks and evals
 
-### Tests — `api/tests/`, 86 of them
+### Tests — `api/tests/`, 90 of them
 
 | File | What it covers |
 |---|---|

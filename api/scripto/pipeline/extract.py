@@ -25,7 +25,7 @@ from scripto.jobs.limits import provider_slot
 from scripto.jobs.registry import register
 from scripto.llm import get_llm
 from scripto.llm.prompts import EXTRACT_SCHEMA, EXTRACT_SYSTEM, extract_prompt
-from scripto.models import Chunk, Claim, Entity, Job
+from scripto.models import Chunk, Claim, Entity, EpisodeSource, Job
 
 log = logging.getLogger(__name__)
 
@@ -154,6 +154,21 @@ def run_extract(db: Session, job: Job) -> None:
     if entity is None:
         return
 
+    # A topic source is read against the one topic it was found for. Topic
+    # sources used to be read against a label naming only the host's first three
+    # topics, so a 20-section paper on habit extinction yielded nothing.
+    topic = db.scalar(
+        select(EpisodeSource.topic).where(
+            EpisodeSource.episode_id == job.episode_id,
+            EpisodeSource.source_id == source_id,
+            EpisodeSource.subject_entity_id == subject_id,
+        )
+    )
+    subject_name = topic or entity.name
+    # A repair re-reads chunks already extracted (say, against the wrong
+    # subject); ordinary retries skip them to stay cheap.
+    reread = bool(job.payload.get("reread"))
+
     extractor_version = get_llm().version
     chunks = list(
         db.scalars(
@@ -171,10 +186,10 @@ def run_extract(db: Session, job: Job) -> None:
                 Claim.extractor_version == extractor_version,
             )
         )
-        if already:
+        if already and not reread:
             continue
 
-        for claim in extract_from_chunk(chunk, entity.name):
+        for claim in extract_from_chunk(chunk, subject_name):
             stmt = (
                 pg_insert(Claim)
                 .values(

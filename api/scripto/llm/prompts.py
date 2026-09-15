@@ -202,22 +202,48 @@ SECTION_BRIEFS = {
     "interviews. The host uses this to avoid asking what they have answered many times.",
     "unexplored_angles": "Topics adjacent to their expertise where public coverage is "
     "thin. These are opportunities for original material.",
-    "topic_brief": "A briefing on the subject itself: state of play, live debates, and "
-    "notable recent developments.",
+    "topic_brief": "A briefing on each of the host's topics: state of play, live debates, "
+    "and notable recent developments. Give every topic its own items.",
 }
 
 
-def dossier_prompt(section: str, subject: str, claims: list[tuple[str, str, str | None]]) -> str:
+def _claim_line(claim_id: str, text: str, date: str | None) -> str:
+    stamp = f" ({date})" if date else ""
+    return f"[{claim_id}]{stamp} {text}"
+
+
+def dossier_prompt(
+    section: str,
+    subject: str,
+    claims: list[tuple[str, str, str | None]],
+    topic_of: dict[str, str | None] | None = None,
+) -> str:
     lines = [
         f"Subject: {subject}",
         f"Section: {section}",
         f"Brief: {SECTION_BRIEFS.get(section, '')}",
         "",
-        "Claims available to you (id in brackets):",
     ]
-    for claim_id, text, date in claims:
-        stamp = f" ({date})" if date else ""
-        lines.append(f"[{claim_id}]{stamp} {text}")
+    if topic_of is None:
+        lines.append("Claims available to you (id in brackets):")
+        lines += [_claim_line(*c) for c in claims]
+    else:
+        # Grouped under the host's topics, so the writer sees what each topic
+        # has and covers every one rather than only the best-stocked.
+        groups: dict[str | None, list[tuple[str, str, str | None]]] = {}
+        for claim in claims:
+            groups.setdefault(topic_of.get(claim[0]), []).append(claim)
+        named = [t for t in groups if t]
+        if named:
+            lines.append(
+                "Cover every one of these topics with at least one item, in this order: "
+                + "; ".join(named)
+                + "."
+            )
+        lines.append("Claims available to you, grouped by topic (id in brackets):")
+        for topic, group in groups.items():
+            lines += ["", f"Topic: {topic or 'General'}"]
+            lines += [_claim_line(*c) for c in group]
     lines += ["", "Write the section as a list of items, each citing its claim ids."]
     return "\n".join(lines)
 

@@ -93,7 +93,7 @@ def _check_quota(db: Session, user: User) -> None:
 def _sources_for(db: Session, episode_id: uuid.UUID) -> list[SourceOut]:
     topic_id = db.scalar(select(Episode.topic_entity_id).where(Episode.id == episode_id))
     rows = db.execute(
-        select(Source, EpisodeSource.added_by, EpisodeSource.subject_entity_id)
+        select(Source, EpisodeSource.added_by, EpisodeSource.subject_entity_id, EpisodeSource.topic)
         .join(EpisodeSource, EpisodeSource.source_id == Source.id)
         .where(EpisodeSource.episode_id == episode_id, EpisodeSource.removed_at.is_(None))
         .order_by(Source.created_at)
@@ -110,8 +110,9 @@ def _sources_for(db: Session, episode_id: uuid.UUID) -> list[SourceOut]:
             error=s.error,
             added_by=added_by,
             subject="topic" if topic_id and subject_id == topic_id else "guest",
+            topic=topic,
         )
-        for s, added_by, subject_id in rows
+        for s, added_by, subject_id, topic in rows
     ]
 
 
