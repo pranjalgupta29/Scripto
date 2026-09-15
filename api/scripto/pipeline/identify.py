@@ -24,13 +24,15 @@ def identify_candidates(name: str, disambiguator: str) -> list[dict]:
 
     results: list[dict] = []
     seen: set[str] = set()
-    with provider_slot("search"):
-        for query in queries:
-            for r in search.search(query, limit=8):
-                if r.url in seen:
-                    continue
-                seen.add(r.url)
-                results.append({"url": r.url, "title": r.title, "snippet": r.snippet})
+    for query in queries:
+        # One slot per search, so budgets and pacing count real calls.
+        with provider_slot("search"):
+            found = search.search(query, limit=8)
+        for r in found:
+            if r.url in seen:
+                continue
+            seen.add(r.url)
+            results.append({"url": r.url, "title": r.title, "snippet": r.snippet})
 
     if not results:
         return []

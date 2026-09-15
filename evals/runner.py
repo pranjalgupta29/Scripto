@@ -101,19 +101,28 @@ class Report:
 
 
 def _drain(max_jobs: int = 800) -> None:
+    """Run the queue to completion; see tests/drain.py for the clock semantics."""
     for _ in range(max_jobs):
-        with session_scope() as db:
-            db.execute(text("UPDATE jobs SET next_attempt_at = now() WHERE state = 'queued'"))
         with session_scope() as db:
             job = queue.dequeue(db, worker_id="eval")
             if job is None:
-                return
+                # Nothing is due. Advance the simulated clock instead of
+                # sleeping; stop once nothing is waiting at all.
+                waiting = db.execute(
+                    text("UPDATE jobs SET next_attempt_at = now() WHERE state = 'queued'")
+                ).rowcount
+                if not waiting:
+                    return
+                continue
             job_id, kind = job.id, job.kind
         with session_scope() as db:
             job = db.get(Job, job_id)
             try:
                 get_handler(kind)(db, job)
                 queue.complete(db, job)
+            except queue.Reschedule as exc:
+                db.rollback()
+                queue.reschedule(db, db.get(Job, job_id), exc.seconds)
             except Exception as exc:
                 db.rollback()
                 queue.fail(db, db.get(Job, job_id), f"{type(exc).__name__}: {exc}")

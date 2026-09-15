@@ -198,12 +198,25 @@ def run_extract(db: Session, job: Job) -> None:
         db.flush()
 
     if produced:
-        queue.enqueue(
-            db,
-            kind="cluster_claims",
-            episode_id=job.episode_id,
-            user_id=job.user_id,
-            payload={"subject_entity_id": str(subject_id)},
-            idempotency_key=None,  # clustering re-runs as new claims arrive
-            delay_seconds=10,
+        # One waiting cluster run per subject is enough: it sees every claim
+        # that exists when it starts. Without this check a 10-source episode
+        # re-clustered the whole guest 10 times.
+        waiting = db.scalar(
+            select(Job.id)
+            .where(
+                Job.kind == "cluster_claims",
+                Job.state == "queued",
+                Job.payload["subject_entity_id"].astext == str(subject_id),
+            )
+            .limit(1)
         )
+        if waiting is None:
+            queue.enqueue(
+                db,
+                kind="cluster_claims",
+                episode_id=job.episode_id,
+                user_id=job.user_id,
+                payload={"subject_entity_id": str(subject_id)},
+                idempotency_key=None,
+                delay_seconds=10,
+            )

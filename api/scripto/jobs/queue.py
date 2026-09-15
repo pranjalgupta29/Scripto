@@ -18,6 +18,20 @@ from sqlalchemy.orm import Session
 from scripto.config import settings
 from scripto.models import Job
 
+
+class Reschedule(Exception):
+    """Raised by a handler that is waiting on other work: run this job again later.
+
+    Unlike a failure it burns no attempt and records no error. Unlike enqueueing
+    a fresh job it adds no row -- a waiting coverage check used to add one every
+    10 seconds, which is what made the progress bar's total keep climbing.
+    """
+
+    def __init__(self, seconds: float = 10.0) -> None:
+        super().__init__(f"reschedule in {seconds}s")
+        self.seconds = seconds
+
+
 # Fair dequeue. COALESCE handles users with no running jobs, who sort first.
 _DEQUEUE_SQL = text(
     """
@@ -150,6 +164,19 @@ def fail(db: Session, job: Job, error: str) -> None:
     db.flush()
 
 
+def reschedule(db: Session, job: Job, seconds: float) -> None:
+    """Put a running job back in the queue without counting it as an attempt."""
+    now = datetime.now(timezone.utc)
+    job.state = "queued"
+    job.attempts = max(0, job.attempts - 1)
+    job.locked_by = None
+    job.lease_expires_at = None
+    job.error = None
+    job.next_attempt_at = now + timedelta(seconds=seconds)
+    job.updated_at = now
+    db.flush()
+
+
 def sweep_expired_leases(db: Session) -> int:
     """Requeue jobs whose lease expired. This is how a crashed worker's jobs come back."""
     result = db.execute(
@@ -169,8 +196,23 @@ def sweep_expired_leases(db: Session) -> int:
     return result.rowcount or 0
 
 
+# The stage shown to the host is the earliest one that still has work waiting.
+_STAGES = [
+    ("Finding sources", {"discover"}),
+    ("Reading sources", {"fetch_source", "parse_source"}),
+    ("Analysing sources", {"extract_claims", "embed"}),
+    ("Building the dossier", {"cluster_claims", "coverage_check", "build_dossier"}),
+    ("Writing the script", {"generate_script"}),
+]
+
+
 def episode_progress(db: Session, episode_id: uuid.UUID) -> dict:
-    """Job counts by state and kind, for the polling endpoint."""
+    """Progress for the polling endpoint, in terms the host cares about.
+
+    Job counts make a poor progress bar: the pipeline creates jobs as it goes,
+    so both numbers climb. The UI shows sources instead -- how many are read and
+    how many analysed -- plus the current stage.
+    """
     rows = db.execute(
         text(
             """
@@ -190,10 +232,46 @@ def episode_progress(db: Session, episode_id: uuid.UUID) -> dict:
 
     total = sum(by_state.values())
     finished = by_state.get("done", 0) + by_state.get("dead", 0)
+
+    outstanding = {
+        kind for kind, states in by_kind.items() if states.get("queued") or states.get("running")
+    }
+    stage = next((label for label, kinds in _STAGES if kinds & outstanding), None)
+
+    # A source is read once fetched and parsed (or failed), and analysed once no
+    # job for it is still waiting. This also covers sources reused from another
+    # episode, which never get a fresh extract job here.
+    sources = db.execute(
+        text(
+            """
+            SELECT
+              count(*),
+              count(*) FILTER (WHERE s.status IN ('parsed', 'failed')),
+              count(*) FILTER (
+                WHERE s.status IN ('parsed', 'failed')
+                  AND NOT EXISTS (
+                    SELECT 1 FROM jobs j
+                    WHERE j.episode_id = :eid
+                      AND j.state IN ('queued', 'running')
+                      AND j.payload->>'source_id' = s.id::text
+                  )
+              )
+            FROM episode_sources es
+            JOIN sources s ON s.id = es.source_id
+            WHERE es.episode_id = :eid AND es.removed_at IS NULL
+            """
+        ),
+        {"eid": episode_id},
+    ).first()
+
     return {
         "total": total,
         "finished": finished,
         "pending": total - finished,
         "by_state": by_state,
         "by_kind": by_kind,
+        "sources_total": sources[0] if sources else 0,
+        "sources_read": sources[1] if sources else 0,
+        "sources_analysed": sources[2] if sources else 0,
+        "stage": stage,
     }

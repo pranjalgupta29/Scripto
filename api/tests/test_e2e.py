@@ -472,3 +472,200 @@ def test_longer_interview_gets_more_questions(auth_client):
         )
 
     assert question_count(90) > question_count(30)
+
+
+# --------------------------------------------------------------------------
+# progress, source allowances, topic research, search budget, regenerate
+# --------------------------------------------------------------------------
+
+
+def _article_html(url: str) -> bytes:
+    """A readable article whose bytes differ per URL (identical bytes are deduped)."""
+    paragraph = (
+        "Researchers studying private credit published new findings on liquidity risk this year. "
+        "Several economists argue that retail investors misjudge how quickly funds can be redeemed. "
+        "Regulators are weighing tighter disclosure rules for private markets. "
+        f"This report was published at {url} for readers following the debate. "
+    ) * 3
+    return (
+        f"<html><head><title>Private markets report {url}</title></head><body><article>"
+        f"<h1>Private markets report</h1><p>{paragraph}</p><p>{paragraph}</p>"
+        "</article></body></html>"
+    ).encode()
+
+
+def test_waiting_coverage_check_adds_no_rows(auth_client, db):
+    """The progress bar climbed because a waiting check added a job every 10s."""
+    from sqlalchemy import func
+
+    from scripto.models import Job
+
+    episode_id = _ready_episode(auth_client)
+    checks = db.scalar(
+        select(func.count(Job.id)).where(
+            Job.episode_id == uuid.UUID(episode_id), Job.kind == "coverage_check"
+        )
+    )
+    # One per discovery run plus one per source the host added, not one per poll.
+    assert checks <= 4, f"{checks} coverage_check rows for one episode"
+
+
+def test_progress_counts_sources_not_jobs(auth_client):
+    episode_id = _ready_episode(auth_client)
+    body = auth_client.get(f"/episodes/{episode_id}").json()
+    progress = body["progress"]
+    assert progress["sources_total"] == len(body["sources"])
+    assert progress["sources_read"] == progress["sources_total"]
+    assert progress["sources_analysed"] == progress["sources_total"]
+    assert progress["pending"] == 0 and progress["stage"] is None
+
+
+def test_host_can_add_sources_after_discovery_fills_its_allowance(auth_client, monkeypatch):
+    """Discovered sources must never block the host from pasting a bio."""
+    from scripto.config import settings
+
+    monkeypatch.setattr(settings, "max_sources_per_episode", 3)
+    episode_id = _episode_with_guest(auth_client)
+    drain()
+    assert len(auth_client.get(f"/episodes/{episode_id}").json()["sources"]) >= 3
+
+    added = auth_client.post(
+        f"/episodes/{episode_id}/sources", json={"text": LONG_TEXT, "title": "Bio"}
+    )
+    assert added.status_code == 201, added.text
+
+
+def test_topic_research_searches_the_topics_and_builds_a_brief(auth_client, db, monkeypatch):
+    from sqlalchemy import func
+
+    from scripto.adapters.web_article import WebArticleAdapter
+    from scripto.config import settings
+    from scripto.models import Job
+    from scripto.search import FakeSearchProvider
+
+    monkeypatch.setattr(settings, "max_sources_per_episode", 3)
+    monkeypatch.setattr(WebArticleAdapter, "fetch", lambda self, url: _article_html(url))
+    queries: list[str] = []
+    original = FakeSearchProvider.search
+
+    def recording(self, query, *, limit=10):
+        queries.append(query)
+        return original(self, query, limit=limit)
+
+    monkeypatch.setattr(FakeSearchProvider, "search", recording)
+
+    episode_id = _episode_with_guest(auth_client)
+    auth_client.post(f"/episodes/{episode_id}/topics", json={"topics": HOST_TOPICS})
+    drain()
+
+    episode = db.get(Episode, uuid.UUID(episode_id))
+    db.refresh(episode)
+    assert episode.coverage_mode in ("thin", "sparse")
+    assert episode.topic_entity_id is not None
+
+    # It searched for the topics, not for the guest again.
+    topic_queries = [q for q in queries if any(t in q for t in HOST_TOPICS)]
+    assert topic_queries, "topic research never searched for the topics"
+    assert not any("Dana Reyes" in q for q in topic_queries)
+
+    topic_claims = db.scalar(
+        select(func.count(Claim.id)).where(Claim.subject_entity_id == episode.topic_entity_id)
+    )
+    assert topic_claims, "no claims were attributed to the topic"
+
+    dossier = auth_client.get(f"/episodes/{episode_id}/dossier").json()
+    assert "topic_brief" in {s["section"] for s in dossier["sections"]}
+
+    # Topic articles are labelled as such and never count toward the guest's label.
+    listed = auth_client.get(f"/episodes/{episode_id}").json()["sources"]
+    guest_listed = [s for s in listed if s["subject"] == "guest"]
+    assert any(s["subject"] == "topic" for s in listed) and guest_listed
+    assert episode.coverage_detail["sources_parsed"] == sum(
+        s["status"] == "parsed" for s in guest_listed
+    )
+
+    # Clustering ran once per wave of claims, not once per source.
+    guest = str(episode.guest_entity_id)
+    runs = lambda kind: db.scalar(  # noqa: E731
+        select(func.count(Job.id)).where(
+            Job.kind == kind, Job.payload["subject_entity_id"].astext == guest
+        )
+    )
+    assert runs("extract_claims") >= 3
+    assert runs("cluster_claims") < runs("extract_claims")
+
+
+def test_search_budget_counts_every_search(auth_client, monkeypatch):
+    """A whole discovery run used to be charged as a single search."""
+    from scripto.config import settings
+    from scripto.jobs.limits import usage
+    from scripto.search import FakeSearchProvider
+
+    monkeypatch.setattr(settings, "budget_search_calls_per_month", 10_000)
+    calls: list[str] = []
+    original = FakeSearchProvider.search
+
+    def counting(self, query, *, limit=10):
+        calls.append(query)
+        return original(self, query, limit=limit)
+
+    monkeypatch.setattr(FakeSearchProvider, "search", counting)
+
+    _episode_with_guest(auth_client)
+    drain()
+    used, _ = usage("search")
+    assert len(calls) > 2
+    assert used == len(calls)
+
+
+def test_regenerate_keeps_the_hosts_edits(auth_client):
+    episode_id = _ready_episode(auth_client)
+    body = {"style_preset": "conversational", "duration_minutes": 45}
+    auth_client.post(f"/episodes/{episode_id}/script", json=body)
+    drain()
+    first = auth_client.get(f"/episodes/{episode_id}/script").json()
+    block = next(s for s in first["segments"] if s["segment_type"] == "topic")
+    auth_client.patch(
+        f"/scripts/{first['id']}/segments/{block['id']}",
+        json={"question": "My own question about this topic?"},
+    )
+
+    auth_client.post(f"/episodes/{episode_id}/script", json=body)
+    drain()
+    second = auth_client.get(f"/episodes/{episode_id}/script").json()
+    assert second["id"] != first["id"]
+    assert second["parent_script_id"] == first["id"]
+    same = next(s for s in second["segments"] if s["topic_id"] == block["topic_id"])
+    assert same["question"] == "My own question about this topic?"
+    assert same["edited_by_user"] is True
+
+
+def test_regenerate_with_a_note_revises_the_current_version(auth_client, monkeypatch):
+    from scripto.llm.fake import FakeProvider
+
+    prompts: list[str] = []
+    original = FakeProvider._task_generate_script
+
+    def recording(self, prompt):
+        prompts.append(prompt)
+        return original(self, prompt)
+
+    monkeypatch.setattr(FakeProvider, "_task_generate_script", recording)
+
+    episode_id = _ready_episode(auth_client)
+    auth_client.post(f"/episodes/{episode_id}/script", json={"style_preset": "conversational"})
+    drain()
+    first_id = auth_client.get(f"/episodes/{episode_id}/script").json()["id"]
+
+    note = "Spend more time on liquidity risk and keep questions shorter."
+    auth_client.post(
+        f"/episodes/{episode_id}/script",
+        json={"style_preset": "conversational", "feedback": note},
+    )
+    drain()
+
+    second = auth_client.get(f"/episodes/{episode_id}/script").json()
+    assert second["feedback"] == note
+    assert second["parent_script_id"] == first_id
+    assert note in prompts[-1], "the host's note never reached the model"
+    assert "Current version of this run-of-show" in prompts[-1]

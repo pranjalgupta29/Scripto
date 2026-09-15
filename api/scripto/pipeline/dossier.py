@@ -54,6 +54,10 @@ def _claims_for_section(
             .where(ClaimCluster.source_count >= settings.already_covered_min_sources)
             .order_by(ClaimCluster.source_count.desc())
         )
+    elif section == "topic_brief":
+        stmt = stmt.where(Claim.kind.in_(["fact", "opinion", "prediction"])).order_by(
+            Claim.claim_date.desc().nullslast()
+        )
     else:  # unexplored_angles
         stmt = (
             stmt.outerjoin(ClaimCluster, Claim.cluster_id == ClaimCluster.id)

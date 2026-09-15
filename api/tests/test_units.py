@@ -278,3 +278,64 @@ def test_claim_ids_never_leak_into_script_text():
         ["Answered in 4 prior interviews", "53a2b199-50f9-46a7-87e5-55d91ae596f7", "  ", None]
     )
     assert cleaned == ["Answered in 4 prior interviews"]
+
+
+def test_reschedule_requeues_without_burning_an_attempt(db):
+    """A handler waiting on other work goes back in the queue as the same job."""
+    user = _user(db)
+    queue.enqueue(db, kind="discover", user_id=user.id, idempotency_key="resched")
+    job = queue.dequeue(db, worker_id="w")
+    assert job.attempts == 1
+
+    queue.reschedule(db, job, 30)
+    db.commit()
+    assert job.state == "queued"
+    assert job.attempts == 0 and job.error is None
+    # Not due for another 30 seconds.
+    assert queue.dequeue(db, worker_id="w") is None
+
+
+# --------------------------------------------------------------------------
+# coverage labels: "rich" is relative to the source limit
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("cap, needed", [(3, 4), (8, 6), (25, 19)])
+def test_rich_needs_a_share_of_the_source_limit(monkeypatch, cap, needed):
+    from scripto.config import settings
+    from scripto.pipeline.coverage import rich_min_sources
+
+    monkeypatch.setattr(settings, "max_sources_per_episode", cap)
+    assert rich_min_sources() == needed
+
+
+def test_one_failed_download_no_longer_rules_out_rich(monkeypatch):
+    """With 8 fetched and 1 failed, a well-covered guest used to be stuck at thin."""
+    from scripto.config import settings
+    from scripto.pipeline.coverage import _mode
+
+    monkeypatch.setattr(settings, "max_sources_per_episode", 8)
+    assert _mode(7, 40, True) == "rich"
+    assert _mode(7, 40, False) == "thin"  # no interview, podcast or talk found
+    assert _mode(2, 40, True) == "sparse"
+
+
+@pytest.mark.parametrize(
+    "title, url, source_type, chars, expected",
+    [
+        ("Andrew Huberman - Wikipedia", "https://en.wikipedia.org/wiki/Andrew_Huberman",
+         "web_article", 15688, False),
+        ("In conversation with Andrew Huberman", "https://example.com/huberman",
+         "web_article", 12000, True),
+        ("A short podcast teaser", "https://example.com/p", "web_article", 900, False),
+        ("Anything at all", "https://www.youtube.com/watch?v=x", "youtube", 0, True),
+    ],
+)
+def test_long_form_means_an_appearance_not_just_a_long_page(
+    title, url, source_type, chars, expected
+):
+    from scripto.models import Source
+    from scripto.pipeline.coverage import is_long_form
+
+    source = Source(title=title, url=url, type=source_type)
+    assert is_long_form(source, chars) is expected

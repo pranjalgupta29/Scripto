@@ -72,8 +72,8 @@ def identify_prompt(name: str, disambiguator: str, results: list[dict]) -> str:
 # extract claims
 # --------------------------------------------------------------------------
 
-EXTRACT_SYSTEM = """You extract atomic factual claims about a specific person from a \
-passage of text.
+EXTRACT_SYSTEM = """You extract atomic factual claims about a specific subject -- a \
+person, or a topic being researched -- from a passage of text.
 
 Rules:
 - One idea per claim. Split compound sentences.
@@ -342,6 +342,8 @@ def script_prompt(
     already_covered: list[str],
     optimize_order: bool,
     include_bonus: bool,
+    previous_version: list[str] | None = None,
+    feedback: str | None = None,
 ) -> str:
     lines = [
         f"Episode title: {episode_title}",
@@ -383,6 +385,23 @@ def script_prompt(
     if already_covered:
         lines += ["", "Already covered repeatedly elsewhere -- avoid, or find a fresh angle:"]
         lines.extend(f"- {c}" for c in already_covered)
+
+    if previous_version:
+        lines += ["", "Current version of this run-of-show:"]
+        lines.extend(previous_version)
+        if feedback:
+            lines += [
+                "",
+                f"The host's feedback on the current version: {feedback}",
+                "Revise the current version to address this feedback. Keep what the "
+                "feedback does not ask to change, including blocks the host edited.",
+            ]
+        else:
+            lines += [
+                "",
+                "Write a fresh alternative to the current version. Blocks marked as "
+                "edited by the host will be kept as they are.",
+            ]
 
     if include_bonus:
         lines += [

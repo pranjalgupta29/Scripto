@@ -63,7 +63,7 @@ npm run dev        # http://localhost:3000
 ### Tests and evals
 
 ```bash
-cd api && .venv/bin/pytest          # 67 tests
+cd api && .venv/bin/pytest          # 83 tests
 python -m evals.runner              # from the repo root
 ```
 
@@ -166,7 +166,7 @@ api/
     jobs/        queue, worker loop, registry, provider caps
     routes/      auth, episodes, export
     models.py    full schema
-  tests/         67 tests incl. the section 9 acceptance criteria
+  tests/         83 tests incl. the section 9 acceptance criteria
 web/             next.js app
 evals/           fixtures + runner
 ```

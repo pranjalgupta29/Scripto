@@ -182,6 +182,11 @@ class EpisodeSource(Base):
         ForeignKey("sources.id", ondelete="CASCADE"), nullable=False, index=True
     )
     added_by: Mapped[str] = mapped_column(String(16), default="system", nullable=False)  # system|user
+    # Which research this source serves: the guest, or the topic brief. NULL is
+    # treated as the guest (host-added sources, and rows from before this existed).
+    subject_entity_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("entities.id", ondelete="SET NULL")
+    )
     removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False
@@ -350,6 +355,12 @@ class Script(Base, TimestampMixin):
     # overflowed claims.extractor_version at 32 characters.
     model_version: Mapped[str] = mapped_column(String(255), nullable=False)
     duration_minutes: Mapped[int | None] = mapped_column(Integer)
+    # Regeneration: the version this one revises, and what the host asked to
+    # change. Earlier versions are kept, never overwritten.
+    parent_script_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("scripts.id", ondelete="SET NULL")
+    )
+    feedback: Mapped[str | None] = mapped_column(Text)
 
 
 class ScriptSegment(Base):

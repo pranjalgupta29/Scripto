@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import func, select
+import math
+
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from scripto.config import settings
@@ -33,8 +35,41 @@ from scripto.models import (
 
 # A long-form appearance is the strongest single signal that a guest has said
 # enough in public to build an episode around.
-LONG_FORM_TYPES = {"youtube"}
 LONG_FORM_MIN_CHARS = 8000
+# A long-form appearance means a video, or a long page that is an interview,
+# podcast, talk or transcript. A long encyclopedia or profile page is not an
+# appearance -- Wikipedia used to qualify just by being long.
+LONG_FORM_HINTS = (
+    "interview",
+    "podcast",
+    "transcript",
+    "conversation",
+    "episode",
+    "talk",
+    "keynote",
+    "fireside",
+    "q&a",
+    "webinar",
+)
+
+
+def is_long_form(source: Source, chars: int) -> bool:
+    if source.type == "youtube":
+        return True
+    label = f"{source.title or ''} {source.url or ''}".lower()
+    return chars >= LONG_FORM_MIN_CHARS and any(hint in label for hint in LONG_FORM_HINTS)
+
+
+def rich_min_sources() -> int:
+    """How many readable guest sources "rich" needs.
+
+    A share of what discovery fetches, not a fixed number. With a fixed 8 and a
+    source limit of 8, one failed download made "rich" impossible, so even Satya
+    Nadella and Andrew Huberman first came out "thin". The floor stops a tiny
+    source limit from making almost anyone "rich".
+    """
+    share = math.ceil(settings.max_sources_per_episode * settings.coverage_rich_share)
+    return max(settings.coverage_thin_min_sources + 1, share)
 
 
 def score_coverage(db: Session, episode: Episode) -> dict:
@@ -47,6 +82,13 @@ def score_coverage(db: Session, episode: Episode) -> dict:
             .where(
                 EpisodeSource.episode_id == episode.id,
                 EpisodeSource.removed_at.is_(None),
+                # Only the guest's own sources. Topic research articles once
+                # counted here, which could push a thin guest to "rich" and hide
+                # the topic brief built for them. NULL means the guest.
+                or_(
+                    EpisodeSource.subject_entity_id.is_(None),
+                    EpisodeSource.subject_entity_id == subject_id,
+                ),
             )
         )
     )
@@ -74,18 +116,17 @@ def score_coverage(db: Session, episode: Episode) -> dict:
 
     has_long_form = False
     for source in parsed:
-        if source.type in LONG_FORM_TYPES:
-            has_long_form = True
-            break
-        total = (
-            db.scalar(
-                select(func.coalesce(func.sum(func.length(Chunk.text)), 0)).where(
-                    Chunk.source_id == source.id
+        chars = 0
+        if source.type != "youtube":
+            chars = (
+                db.scalar(
+                    select(func.coalesce(func.sum(func.length(Chunk.text)), 0)).where(
+                        Chunk.source_id == source.id
+                    )
                 )
+                or 0
             )
-            or 0
-        )
-        if total >= LONG_FORM_MIN_CHARS:
+        if is_long_form(source, chars):
             has_long_form = True
             break
 
@@ -109,7 +150,7 @@ def score_coverage(db: Session, episode: Episode) -> dict:
 
 def _mode(parsed: int, clusters: int, has_long_form: bool) -> str:
     if (
-        parsed >= settings.coverage_rich_min_sources
+        parsed >= rich_min_sources()
         and clusters >= settings.coverage_rich_min_clusters
         and has_long_form
     ):
@@ -126,7 +167,7 @@ def _missing(mode: str, parsed: int, has_long_form: bool) -> list[str]:
     asks = []
     if not has_long_form:
         asks.append("a recording or transcript of a past talk, webinar or podcast appearance")
-    if parsed < settings.coverage_rich_min_sources:
+    if parsed < rich_min_sources():
         asks.append("their CV, bio or internal notes about them")
         asks.append("links to anything they have written")
     return asks
@@ -141,23 +182,20 @@ def run_coverage(db: Session, job: Job) -> None:
 
     # Wait for ingestion to finish before judging coverage, otherwise an
     # episode looks sparse simply because its fetches have not run yet.
+    # Clustering is waited on too, so the dossier never uses stale clusters.
     outstanding = db.scalar(
         select(func.count(Job.id)).where(
             Job.episode_id == episode.id,
-            Job.kind.in_(["fetch_source", "parse_source", "extract_claims", "embed"]),
+            Job.id != job.id,
+            Job.kind.in_(
+                ["discover", "fetch_source", "parse_source", "extract_claims", "embed", "cluster_claims"]
+            ),
             Job.state.in_(["queued", "running"]),
         )
     )
     if outstanding:
-        queue.enqueue(
-            db,
-            kind="coverage_check",
-            episode_id=episode.id,
-            user_id=job.user_id,
-            payload={},
-            delay_seconds=10,
-        )
-        return
+        # Run this same job again later, rather than adding a new one each time.
+        raise queue.Reschedule(10)
 
     detail = score_coverage(db, episode)
     episode.coverage_mode = detail["mode"]
@@ -179,9 +217,24 @@ def run_coverage(db: Session, job: Job) -> None:
         episode_id=episode.id,
         user_id=job.user_id,
         payload={},
+        # Keyed on everything the dossier is built from, so claims arriving
+        # later -- for the guest or for the topic brief -- always trigger a
+        # rebuild, while a repeat check with nothing new stays a no-op.
         idempotency_key=(
-            f"dossier:{episode.id}:{detail['mode']}:{detail['claim_count']}"
+            f"dossier:{episode.id}:{detail['mode']}:{detail['claim_count']}:"
+            f"{_topic_claim_count(db, episode)}"
         ),
+    )
+
+
+def _topic_claim_count(db: Session, episode: Episode) -> int:
+    if episode.topic_entity_id is None:
+        return 0
+    return (
+        db.scalar(
+            select(func.count(Claim.id)).where(Claim.subject_entity_id == episode.topic_entity_id)
+        )
+        or 0
     )
 
 

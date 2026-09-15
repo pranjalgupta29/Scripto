@@ -65,6 +65,13 @@ def _run_one(worker_id: str) -> bool:
             handler(db, job)
             queue.complete(db, job)
         log.info("job %s (%s) done", job_id, kind)
+    except queue.Reschedule as exc:
+        # Waiting on other work: run this same job again later. No attempt
+        # burned, no error recorded, no new row.
+        with session_scope() as db:
+            job = db.get(Job, job_id)
+            if job is not None:
+                queue.reschedule(db, job, exc.seconds)
     except BudgetExceeded as exc:
         # Terminal. Retrying cannot make budget appear, and a retry loop is the
         # exact failure mode the budget exists to prevent.

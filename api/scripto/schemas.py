@@ -59,6 +59,8 @@ class SourceOut(BaseModel):
     status: str
     error: str | None
     added_by: str
+    # Which research this source serves: "guest", or "topic" for the topic brief.
+    subject: str = "guest"
 
     model_config = {"from_attributes": True}
 
@@ -75,6 +77,11 @@ class JobProgress(BaseModel):
     pending: int
     by_state: dict[str, int]
     by_kind: dict[str, dict[str, int]]
+    # What the progress bar shows: sources, not jobs.
+    sources_total: int = 0
+    sources_read: int = 0
+    sources_analysed: int = 0
+    stage: str | None = None
 
 
 class EntityOut(BaseModel):
@@ -177,6 +184,11 @@ class CreateScriptRequest(BaseModel):
     include_bonus: bool = Field(
         default=True, description="Also suggest backup topics for when time allows."
     )
+    feedback: str | None = Field(
+        default=None,
+        max_length=2000,
+        description="What should change compared with the current version.",
+    )
 
 
 class SegmentOut(BaseModel):
@@ -206,6 +218,8 @@ class ScriptResponse(BaseModel):
     style_preset: str
     model_version: str
     duration_minutes: int | None = None
+    feedback: str | None = None
+    parent_script_id: uuid.UUID | None = None
     created_at: datetime
     segments: list[SegmentOut]
 

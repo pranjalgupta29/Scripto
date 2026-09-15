@@ -159,7 +159,7 @@ Each entry: what we chose, why, what we rejected, and when to revisit.
   PDFs (`pypdf`), YouTube captions (`youtube-transcript-api`), tokenisers
   (`tiktoken`) and first-party LLM SDKs. FastAPI gives typed request and response
   models through Pydantic and generates OpenAPI docs at `/docs`. SQLAlchemy 2's
-  typed mappings keep models readable. Alembic manages migrations; there are 6 so
+  typed mappings keep models readable. Alembic manages migrations; there are 8 so
   far.
 - **Python version.** The machine has 3.14, but several libraries lag behind, so
   `uv` pins a 3.12 virtualenv.
@@ -350,7 +350,7 @@ erDiagram
 | `entities` | A person, company or topic | Display fields (headline, employer, photo) are frozen at identification |
 | `episodes` | One research job | `status`: identifying → ingesting → dossier_ready → script_ready. `coverage_detail` JSONB also holds the identity candidates |
 | `sources` | One fetched document, shared globally | `status`: pending, fetched, parsed, failed. `error` is shown in the UI |
-| `episode_sources` | Links episodes to sources | `added_by` is system or user; `removed_at` is a soft remove |
+| `episode_sources` | Links episodes to sources | `added_by` is system or user; `removed_at` is a soft remove; `subject_entity_id` says whether the source serves the guest or the topic brief (NULL means the guest) |
 | `chunks` | A piece of a source, about 750 tokens | Exactly one position pair is set: character offsets for text, milliseconds for audio/video. A CHECK constraint enforces it |
 | `claims` | One atomic assertion about an entity | `kind`: biographical, opinion, fact, anecdote, prediction. `span_start`/`span_end` locate its quote inside the chunk |
 | `claim_clusters` | Groups of claims that say the same thing | `source_count` counts **distinct sources**, not claims |
@@ -376,7 +376,9 @@ and `embedding`. Jobs gained `idempotency_key`. Episodes gained
 `api/scripto/migrations/versions/`, in order: initial schema (which also creates
 the `vector` extension), provider budgets, provider pacing, widen
 `extractor_version`, dossier cluster FK set null, run-of-show script segments
-(which also widens `scripts.model_version` for the same reason as §16).
+(which also widens `scripts.model_version` for the same reason as §16), script
+revisions (`parent_script_id`, `feedback`), and source subjects
+(`episode_sources.subject_entity_id`, backfilled from job payloads and claims).
 
 ---
 
@@ -403,14 +405,14 @@ flowchart TD
 |---|---|---|---|---|
 | identify | `POST /identify`, inline | 2 searches, 1 LLM | none | 422 to the user |
 | suggest topics | `POST /topics/suggest`, inline | 1 LLM | none | 429 / 503 / 502 to the user |
-| discover | confirm-guest | ~7 searches | `discover:{episode}` | per-query errors are skipped |
+| discover | confirm-guest (guest) or the coverage check (topic) | ~7 searches (guest), up to 8 (topic) | `discover:{episode}`, `discover-topic:{episode}` | per-query errors are skipped; running out of search budget stops early |
 | fetch_source | discover or user URL | 1 fetch | `fetch:{source}` | source marked failed; the job itself succeeds |
 | parse_source | fetch or pasted text | none | `parse:{source}:{checksum}` | source marked failed |
 | embed | parse | batches of 64 | `embed:{source}:{checksum}` | retry, then dead |
 | extract_claims | parse | 1 LLM per chunk | `extract:{source}:{subject}:{checksum}` | retry, then dead |
-| cluster_claims | extract | embeddings + LLM confirmations | none (meant to re-run) | retry, then dead |
-| coverage_check | discover, source added, topics set | none | none | re-enqueues itself |
-| build_dossier | coverage_check | 1 LLM per section | `dossier:{episode}:{mode}:{claim_count}` | retries if 0 items were built from >0 claims |
+| cluster_claims | extract, at most one waiting per subject | embeddings + LLM confirmations | none | retry, then dead |
+| coverage_check | each discovery run, a source added, topics set | none | `coverage:{episode}:{discover job}` for discovery runs | waits by rescheduling itself, adding no rows |
+| build_dossier | coverage_check | 1 LLM per section | `dossier:{episode}:{mode}:{guest claims}:{topic claims}` | retries if 0 items were built from >0 claims |
 | generate_script | `POST /script` | 0–1 voice + 1 script | `script:{script}` | retry, then dead |
 
 ### 5.1 Identify — `pipeline/identify.py`
@@ -430,15 +432,30 @@ flowchart TD
 
 ### 5.2 Discover — `pipeline/discover.py`
 
-- Runs these query patterns, 6 results each:
-  `"{name}" {employer} news` · `"{name}" interview` · `"{name}" podcast` ·
-  `"{name}" site:youtube.com` · `"{name}" blog OR substack OR essay` ·
-  `"{name}" bio {employer}` · and, when an employer is known,
-  `"{name}" {employer} earnings call OR 10-K OR filing`.
-- Canonicalises and dedupes URLs, and stops at `MAX_SOURCES_PER_EPISODE`.
-- `attach_source()` reuses the global source row if one exists and only creates
-  new ones. It enqueues a fetch for each pending source, then enqueues
-  `coverage_check` with a 5 s delay.
+A discovery run researches one subject: the guest, or (for thin and sparse
+episodes) the topic entity named in the job payload.
+
+- **Guest queries**, 6 results each: `"{name}" {employer} news` ·
+  `"{name}" interview` · `"{name}" podcast` · `"{name}" site:youtube.com` ·
+  `"{name}" blog OR substack OR essay` · `"{name}" bio {employer}` · and, when an
+  employer is known, `"{name}" {employer} earnings call OR 10-K OR filing`.
+- **Topic queries:** `{topic} explained` and `{topic} latest research` for each
+  of the host's topics, at most 8 searches.
+- Every search is charged to the search budget and paced on its own. Until
+  2026-09-15 the whole run counted as one charge, so the budget undercounted by
+  about 7×.
+- It canonicalises and dedupes URLs and stops at `MAX_SOURCES_PER_EPISODE` for
+  this run. Guest research and topic research each get that allowance. Sources
+  the host adds by hand have their own allowance and are never blocked by
+  discovered ones.
+- `attach_source()` reuses the global source row if one exists. A new source
+  gets a fetch job. A source already parsed for another episode goes straight to
+  extraction for this subject. Both carry the subject id, so claims are
+  attributed to the guest or to the topic as appropriate.
+- Then it enqueues one `coverage_check` for this run.
+- **How many sources is enough?** Nothing decides that yet. Discovery takes the
+  first results until the allowance is used up, with no ranking by quality, and
+  never searches further when coverage turns out thin (§17).
 - **URL canonicalisation** (`adapters/base.py`) forces https, lowercases the
   host, strips `www.` and default ports, drops tracking parameters (`utm_*`,
   `fbclid`, `gclid`, `mc_*`, `ref_*`, `igshid`), strips the trailing slash and
@@ -516,8 +533,9 @@ flowchart TD
 - Chunks already extracted at the current `extractor_version` are skipped.
   Inserts use `ON CONFLICT DO NOTHING` on `(chunk_id, text_hash,
   extractor_version)`.
-- If anything was produced, `cluster_claims` is enqueued with no idempotency key
-  and a 10 s delay.
+- If anything was produced, `cluster_claims` is enqueued with a 10 s delay,
+  unless one is already waiting for this subject. That run will see every claim
+  that exists when it starts, so a 10-source episode clusters once, not 10 times.
 - **Gap.** "Only claims about the subject" is enforced only by the prompt. A
   claim about Steve Ballmer inside a Nadella article could get through. Eval
   traps are meant to catch this.
@@ -542,21 +560,31 @@ flowchart TD
 
 ### 5.8 Coverage check — `pipeline/coverage.py`
 
-- Waits until the episode has no queued or running `fetch_source`,
-  `parse_source`, `extract_claims` or `embed` jobs, re-enqueuing itself every
-  10 s until then.
-- Scores sources parsed, failed and total; claim count; cluster count; the date
-  span of claims; and whether a long-form appearance exists (a YouTube source,
-  or one source with ≥ 8000 characters of chunks).
-- Chooses a mode: **rich** needs ≥ 8 parsed sources, ≥ 15 clusters and a
-  long-form appearance; **thin** needs ≥ 3 parsed; anything less is **sparse**.
-  It also records a `missing[]` list of specific things to ask the user for.
-- For thin and sparse episodes it creates a topic entity and enqueues topic
-  discovery. That path is not wired yet; see §10.
-- Enqueues `build_dossier` with a key that includes the claim count, so new
-  claims always trigger a rebuild (§16).
-- **Gap.** `cluster_claims` is not on the wait list, so the dossier can be built
-  before clustering finishes.
+- Waits until the episode has no queued or running `discover`, `fetch_source`,
+  `parse_source`, `extract_claims`, `embed` or `cluster_claims` jobs. While it
+  waits it raises `Reschedule`, which puts the same job back in the queue 10 s
+  later. It used to insert a new job every 10 s instead. That is what made the
+  progress bar's total climb: 33 of one real episode's 82 jobs were these checks.
+- Scores **the guest's own sources only** (topic research articles once counted
+  too): parsed, failed and total; claim count; cluster count; the date span of
+  the claims; and whether a long-form appearance exists. Long-form means a
+  YouTube source, or a page of ≥ 8000 characters whose title or URL marks it as
+  an interview, podcast, talk or transcript. A long Wikipedia page used to count.
+- Chooses a mode. **Rich** needs 75% of the source limit readable (6 when the
+  limit is 8, 19 when it is 25, never fewer than the thin threshold plus one),
+  ≥ 15 clusters and a long-form appearance. **Thin** needs ≥ 3 readable sources;
+  anything less is **sparse**. It also records a `missing[]` list of specific
+  things to ask the host for.
+- "Rich" used to need a fixed 8 readable sources while discovery fetched 8, so a
+  single failed download ruled it out. That is why Satya Nadella and Andrew
+  Huberman were both first labelled "thin".
+- For thin and sparse episodes that have topics, it creates a topic entity and
+  starts topic research (§10).
+- Enqueues `build_dossier`, keyed on the mode and the claim counts for both the
+  guest and the topic, so new claims always trigger a rebuild.
+- Each discovery run gets its own check (key `coverage:{episode}:{discover job}`).
+  A single shared key used to discard the topic run's check, and one real
+  dossier missed 24 claims that arrived 16 seconds after it was built (§16).
 
 ### 5.9 Build dossier — `pipeline/dossier.py`
 
@@ -571,7 +599,7 @@ flowchart TD
 | public_positions | `opinion` and `prediction`, oldest first, so shifts over time show |
 | already_covered | claims in clusters with `source_count ≥ 3` |
 | unexplored_angles | `fact`, `opinion` and `anecdote`, least-covered clusters first |
-| topic_brief | the topic entity's claims (thin/sparse only; §10) |
+| topic_brief | the topic entity's `fact`, `opinion` and `prediction` claims, newest first (thin/sparse only; §10) |
 
 - **Verification.** An item survives only if at least one of its `claim_ids` is
   in the set of claims actually given to the model. A made-up id counts the same
@@ -639,7 +667,17 @@ code after the order is fixed.
   in the timeline;
 - bare UUIDs are removed from every text list, since Gemini put a claim id into
   `risk_flags` on the first real run;
-- regenerating replaces the blocks and their citations.
+- each generation is a new script version; earlier ones stay stored.
+
+**Regenerating.** Every generation is a new script version that points at the one
+it revises (`parent_script_id`). Earlier versions stay stored.
+
+- **With a note** (the "What should change?" box), the note and a compact copy of
+  the current version go into the prompt, and the model is told to revise it
+  rather than start over.
+- **Without a note**, the model writes a fresh take, and code then copies back
+  every block the host edited (matched by topic, or by opening and closing), so
+  a plain regenerate never loses edits.
 
 **Voice sample.** One call turns an uploaded transcript into style descriptors
 (pacing, register, question length, signature moves). Only the descriptors reach
@@ -654,8 +692,9 @@ returned as a risk flag (now filtered in code); the closing transition stated
 facts (cricket, his time at Sun) despite the rule against it; two suggestions
 showed the same evidence quote, and one quote did not support its topic.
 
-**Gaps.** Regenerating discards the host's edits. Nothing enforces "no facts in
-transitions". Script quality has been judged on this one run only.
+**Gaps.** Nothing enforces "no facts in transitions". With a note, the model may
+rewrite blocks the host edited, by design, since the note may ask for exactly
+that. Script quality has been judged on one real run only.
 
 ### 5.11 Editing and export
 
@@ -695,6 +734,7 @@ stateDiagram-v2
   running --> dead: exception on 4th attempt
   running --> dead: BudgetExceeded
   running --> queued: SlotUnavailable - attempt refunded
+  running --> queued: Reschedule - waiting on other work, attempt refunded
   running --> queued: lease expired - sweeper
   done --> [*]
   dead --> [*]
@@ -737,7 +777,8 @@ uses `clock_timestamp()`, the actual wall clock.
 - On SIGTERM it stops claiming work and lets in-flight jobs finish.
 - Exception handling: `BudgetExceeded` marks the job dead immediately.
   `SlotUnavailable` requeues it and gives back the attempt, so a busy provider
-  never kills jobs. Anything else goes through the normal backoff.
+  never kills jobs. `Reschedule` puts the same job back after a set delay, for
+  handlers waiting on other work. Anything else goes through the normal backoff.
 
 ### 6.6 Idempotency keys
 
@@ -748,9 +789,10 @@ uses `clock_timestamp()`, the actual wall clock.
 | `parse:{source}:{checksum}` | Re-parses only when the content changes |
 | `embed:{source}:{checksum}` | Same |
 | `extract:{source}:{subject}:{checksum}` | Per subject, because claims belong to the entity |
-| `dossier:{episode}:{mode}:{claim_count}` | Must change when inputs change (§16) |
+| `dossier:{episode}:{mode}:{guest claims}:{topic claims}` | Must change when inputs change (§16) |
+| `coverage:{episode}:{discover job}` | One check per discovery run; a shared key discarded the topic run's check (§16) |
 | `script:{script}` | One generation per script version |
-| none on `coverage_check`, `cluster_claims` | Meant to re-run as new work lands |
+| none on `cluster_claims` (at most one waiting per subject, checked in code) or on checks the host triggers | Meant to re-run as new work lands |
 
 **Rule learned the hard way:** a key has to change whenever the job's inputs
 change. Otherwise the first run wins forever, even a run that happened before
@@ -758,13 +800,19 @@ there was anything to process.
 
 ### 6.7 Progress for the UI
 
-`episode_progress()` groups the episode's jobs by kind and state. "Pending" is
-the total minus done minus dead. This is what the progress bar shows.
+`episode_progress()` still groups the episode's jobs by kind and state, and
+"pending" (total minus done minus dead) still drives polling. But the progress
+bar shows **sources**: how many are read (parsed or failed) and how many are
+analysed (no job for them still waiting), plus the current **stage**: finding,
+reading, analysing, building the dossier, or writing the script. Job counts made
+a poor bar because the pipeline creates jobs as it goes. The source total can
+still grow, but only when topic research adds real sources.
 
 ### 6.8 Known weaknesses
 
 - **Orchestration is implicit.** Stages trigger each other, and `coverage_check`
-  polls by re-enqueuing itself (8–11 of these per episode in the real run).
+  polls by rescheduling itself. It used to add a new job every 10 s: 33 of one
+  real episode's 82 jobs.
   There is no explicit graph and no model of when a stage is complete. Several
   of the ordering bugs in §16 came from this.
 - Two URLs whose content is identical, fetched before either is parsed, can both
@@ -824,6 +872,8 @@ flowchart LR
   - It counts calls, not tokens or dollars, so it is not a true dollar ceiling.
   - A call is charged even if it then fails.
   - Calls to the fake provider are counted too.
+  - Fixed 2026-09-15: discovery charged its ~7 searches as one call. Every search
+    is now charged and paced on its own.
 
 ### 8.2 Pacing — requests per minute, shared by all workers
 
@@ -851,8 +901,10 @@ flowchart LR
 
 ### 8.4 Per-user quotas
 
-At most 10 episodes per user per day (`usage_counters`), and at most 25 sources
-per episode, checked both on user additions and in discover. The spec asked for
+At most 10 episodes per user per day (`usage_counters`). Discovery takes at most
+`MAX_SOURCES_PER_EPISODE` sources per research subject (the guest, and the topic
+brief separately), and the host can add that many again by hand. Discovered
+sources never block the host's own. The spec asked for
 these from day one because they are cheap now and painful to add later.
 
 ### 8.5 Current proof-of-concept values
@@ -929,28 +981,35 @@ what was found.
 `CoverageBanner` in `web/components/ui.tsx` never presents a thin result as a
 full one.
 
-### The topic brief: designed, not finished
+### The topic brief
 
 **The design** (from the spec): the topic and industry brief is not a second
 system. It creates a `topic` entity, runs the same discover, fetch, chunk,
 extract and cluster pipeline against it, and uses a different composer.
 
-**What the code does today:** `coverage_check` creates the topic entity and
-enqueues `discover` with `{"entity_id": <topic>, "mode": "topic"}`. But
-`run_discover` ignores that payload and searches for the **guest** again, and
-`parse_source` enqueues extraction with the **guest** as the subject. The topic
-entity never gets any claims, so the `topic_brief` section never appears. The
-acceptance test only checks that a thin or sparse dossier has *some* section,
-so it did not catch this.
+**How it runs (since 2026-09-15).** Once the coverage check finds a thin or
+sparse guest and the host has saved topics, it creates a topic entity whose
+aliases are the host's topics, and enqueues `discover` with `{"entity_id":
+<topic>, "mode": "topic"}`. Discovery searches for the topics (§5.2), and the
+subject id travels with each source through fetch and parse, so extraction
+attributes the claims to the topic. The topic run's own coverage check then
+rebuilds the dossier with a `topic_brief` section. Saving topics mid-ingestion
+is fine: it only decides when topic research starts.
 
-**To fix:** discover should read the entity from the job payload, the
-extraction subject should come from the job rather than the episode, and the
-topic composer's retrieval rules need checking.
+**Before that fix,** topic discovery ignored its payload and searched for the
+guest again, so the topic entity never got any claims. In one real episode it
+added two more Huberman interviews instead of topic material.
 
-**Calibration.** The real run labelled Satya Nadella, one of the most-covered
-CEOs alive, as **thin**. Causes: the proof-of-concept limit of 8 sources (only 6
-parsed, below the ≥ 8 that rich requires), clusters that mean nothing under fake
-embeddings, and thresholds that have never been checked against real guests.
+**Who gets a topic brief.** Per the spec, only thin and sparse guests. Well-covered
+guests get none, even when the host has chosen specific topics. Whether to change
+that is an open decision (§17).
+
+**Calibration.** Real runs labelled Satya Nadella and Andrew Huberman "thin". The
+cause was a fixed "rich" threshold of 8 readable sources against a source limit of
+8, fixed on 2026-09-15 by making the threshold relative to the limit (§5.8).
+Huberman's false "thin" label also started topic research that was then set aside
+once he was re-scored as rich. The thresholds have still not been checked against
+a set of real guests.
 
 ---
 
@@ -976,7 +1035,7 @@ probed).
 | POST | `/episodes/{id}/topics` | Set 3–6 topics | sync |
 | GET | `/episodes/{id}/topics` | The saved topics | sync |
 | POST | `/episodes/{id}/topics/suggest` | Topic suggestions from the title and research, each labelled research or title-only | sync (inline) |
-| POST | `/episodes/{id}/script` | Style, length (10–240 min), topic-order option, backup topics on/off, optional voice sample | enqueues (202) |
+| POST | `/episodes/{id}/script` | Style, length (10–240 min), topic-order option, backup topics on/off, optional voice sample, optional feedback note (revises the latest version) | enqueues (202) |
 | GET | `/episodes/{id}/script` | Latest script with segments and citations | sync |
 | PATCH | `/scripts/{id}/segments/{sid}` | Edit a segment inline | sync |
 | GET | `/episodes/{id}/export?format=pdf` | PDF download | sync |
@@ -1014,7 +1073,8 @@ reorder topics, and whether to add backup topics. The run-of-show shows each
 block's clock time, hook or transition, host lines, lead and deeper questions,
 follow-ups, risk flags, a red "not backed by the research" badge where a block
 cites nothing, and citations. The question and transition are editable inline,
-and a warning appears when regenerating would replace edits.
+and a "What should change?" box sends a note with the next regenerate. The
+progress card shows sources read and analysed, and the current stage.
 
 **Gaps.** Citation links open the source URL but do not jump to the quoted span or
 the YouTube timestamp; text-fragment and `&t=` deep links would fix that.
@@ -1048,7 +1108,7 @@ the same code can be deployed unchanged.
 | | `CHUNK_TARGET_TOKENS`, `CHUNK_OVERLAP_TOKENS` | 750, 100 | |
 | | `CLUSTER_SIMILARITY_THRESHOLD` | 0.86 | |
 | | `ALREADY_COVERED_MIN_SOURCES` | 3 | |
-| | `COVERAGE_RICH_MIN_SOURCES`, `COVERAGE_RICH_MIN_CLUSTERS`, `COVERAGE_THIN_MIN_SOURCES` | 8, 15, 3 | |
+| | `COVERAGE_RICH_SHARE`, `COVERAGE_RICH_MIN_CLUSTERS`, `COVERAGE_THIN_MIN_SOURCES` | 0.75, 15, 3 | Rich needs this share of `MAX_SOURCES_PER_EPISODE` readable (at least the thin threshold plus one) |
 | Queue | `WORKER_CONCURRENCY` | 4 | Threads per worker process |
 | | `JOB_LEASE_SECONDS`, `JOB_MAX_ATTEMPTS`, `WORKER_POLL_INTERVAL_SECONDS` | 600, 4, 1.0 | |
 | Limits | `PROVIDER_CAP_{LLM,SEARCH,FETCH,EMBEDDING}` | 8, 2, 6, 4 | Concurrent calls |
@@ -1065,12 +1125,12 @@ the same code can be deployed unchanged.
 
 ## 14. Testing, provider checks and evals
 
-### Tests — `api/tests/`, 67 of them
+### Tests — `api/tests/`, 83 of them
 
 | File | What it covers |
 |---|---|
-| `test_units.py` | Span and quote guards, fabricated quotes being rejected, chunk offsets resolving, URL canonicalisation, YouTube ids, idempotency, fair dequeue, lease recovery, backoff until dead, run-of-show timing, claim ids kept out of script text |
-| `test_e2e.py` | A full run through export, the §9 acceptance criteria (failed sources degrade but never fail the run, thin/sparse labelling, reparse with no network, repeated-story clustering, global source dedupe, per-episode removal), the dossier rebuild regression, access control, topic suggestions, the timed run-of-show, host topic order, question count by length |
+| `test_units.py` | Span and quote guards, fabricated quotes being rejected, chunk offsets resolving, URL canonicalisation, YouTube ids, idempotency, fair dequeue, lease recovery, backoff until dead, run-of-show timing, claim ids kept out of script text, rescheduling without burning an attempt, coverage labels relative to the source limit, what counts as long-form |
+| `test_e2e.py` | A full run through export, the §9 acceptance criteria (failed sources degrade but never fail the run, thin/sparse labelling, reparse with no network, repeated-story clustering, global source dedupe, per-episode removal), the dossier rebuild regression, access control, topic suggestions, the timed run-of-show, host topic order, question count by length, progress by sources, topic research, host sources never blocked, regenerating that keeps edits and passes notes, one budget charge per search, topic sources excluded from the guest's label |
 | `test_budget.py` | Budget refusal, disabling a provider, unlimited budgets, a concurrency race against the budget, pacing, pacing shared across workers |
 
 - Tests run against **real Postgres** (the `scripto_test` database) and the
@@ -1150,6 +1210,14 @@ concurrency were involved.
 | Cluster rebuild failed | A foreign key from `dossier_items` blocked deleting clusters | ON DELETE SET NULL | It needed a dossier built before re-clustering |
 | 30% of citations pointed at unrelated text | Models report character offsets badly | Ask for the quote and find it in code | The fake computes its spans correctly |
 | A claim id showed up as a script risk flag | Gemini put a claim UUID into `risk_flags` | Bare UUIDs are dropped from every text list in a block | The fake never does it |
+| The progress bar's numbers kept climbing | The bar counted jobs, and a waiting coverage check added a new job every 10 s | The check reschedules itself; the bar counts sources and shows the stage | The fakes finish instantly, so nothing waits |
+| Topic research added more Huberman interviews | Topic discovery ignored its payload and searched for the guest | Discovery researches the entity it is handed; the subject travels with each source to extraction | No test checked what topic research searched for |
+| The dossier and script missed 24 claims | The topic run's coverage check shared the guest run's key and was discarded as a duplicate | One check per discovery run; the dossier key includes topic claims | Needed a second discovery wave |
+| The host could not paste a bio once discovery filled the source limit | Host-added and discovered sources shared one cap | Separate allowances | Tests used a cap of 25 |
+| The search budget undercounted about 7× | One budget charge wrapped a whole discovery run | One charge per search | Search budgets are unlimited in tests |
+| Two of the most-covered people alive were labelled "thin" | "Rich" needed 8 readable sources while discovery fetched 8, so one failed download ruled it out | "Rich" needs 75% of the source limit readable | Tests fetch 25 sources |
+| Topic articles counted as the guest's sources (16 instead of 9) | Coverage counted every source on the episode | Each attachment records its subject; only the guest's count | Needed topic research to find real topic sources first |
+| A Wikipedia page counted as a long-form appearance | "Long-form" meant any long page | It now means a video, or a long interview, podcast, talk or transcript | The fakes' pages are short |
 | After a restart, every database call failed | Settings found `.env` relative to the working directory. Started from `web/`, the API and worker fell back to a default that pointed at the other Postgres on port 5432 | `.env` and blob storage are located relative to the code, and `DATABASE_URL` is now required | Tests always run from `api/` |
 
 Found while building, before real providers:
@@ -1178,20 +1246,21 @@ In rough priority order:
 2. **Citation support is about 81%** by a crude check. Nothing verifies that a
    quote supports its claim, and nothing verifies that a claim is about the
    subject.
-3. **The topic brief is not wired** (§10), so thin and sparse guests do not get
-   the topic material the spec promises.
+3. **The topic brief is new.** It now researches the topics (§10), but has only
+   been exercised with fake providers.
 4. **"Already covered" has never run on real embeddings.** Clustering happens in
    Python.
-5. **Coverage thresholds are uncalibrated.** Nadella came out as thin.
+5. **Coverage thresholds are only roughly calibrated.** "Rich" is now relative to
+   the source limit (§5.8), but nothing has been checked against a set of real
+   guests. Under fake embeddings the cluster threshold means nothing, because
+   every claim becomes its own cluster.
 6. **Speed on the free tier.** A 25-source episode takes about 15 minutes at
    12 requests a minute, against a 6-minute target. No complete run has been
    timed end to end.
-7. **Scripts.** Regenerating discards the host's edits. Transitions are told not
-   to state facts about the guest, but nothing enforces it. Script quality has
-   been judged on one real run only. (Uncited blocks are now flagged, not
-   silently kept.)
-8. **The coverage check does not wait for clustering**, so the dossier can be
-   built from stale clusters.
+7. **Scripts.** Transitions are told not to state facts about the guest, but
+   nothing enforces it. Script quality has been judged on one real run only.
+8. **Source selection is first come, first served.** Nothing ranks what
+   discovery finds, and nothing searches further when a guest is thin (§5.2).
 9. **Recent news depends on `claim_date`**, which is often empty.
 10. **Chunk embeddings are stored but never used.**
 11. **The budget counts logical calls**, not HTTP retries, tokens or dollars.
@@ -1209,6 +1278,9 @@ In rough priority order:
     first real run two suggestions showed the same quote, and one did not really
     support its topic. A title-only suggestion can still state an unsourced fact
     in its explanation.
+20. **Well-covered guests get no topic brief,** even when the host chose specific
+    topics (§10). Open decision: always research the host's topics, or add a
+    "Research my topics" button.
 
 ---
 

@@ -77,7 +77,15 @@ def _enqueue_parse(db: Session, job: Job, source: Source) -> None:
         kind="parse_source",
         episode_id=job.episode_id,
         user_id=job.user_id,
-        payload={"source_id": str(source.id)},
+        payload={
+            "source_id": str(source.id),
+            # Which subject this source was found for: the guest or the topic.
+            **(
+                {"subject_entity_id": job.payload["subject_entity_id"]}
+                if job.payload.get("subject_entity_id")
+                else {}
+            ),
+        },
         idempotency_key=f"parse:{source.id}:{source.checksum}",
     )
 
@@ -149,16 +157,18 @@ def run_parse(db: Session, job: Job) -> None:
         idempotency_key=f"embed:{source.id}:{source.checksum}",
     )
 
+    # Extract for the subject this source was found for; sources the host adds
+    # carry no subject and belong to the guest.
     episode = db.get(Episode, job.episode_id) if job.episode_id else None
-    if episode is not None and episode.guest_entity_id:
+    subject_id = job.payload.get("subject_entity_id") or (
+        str(episode.guest_entity_id) if episode is not None and episode.guest_entity_id else None
+    )
+    if subject_id:
         queue.enqueue(
             db,
             kind="extract_claims",
             episode_id=job.episode_id,
             user_id=job.user_id,
-            payload={
-                "source_id": str(source.id),
-                "subject_entity_id": str(episode.guest_entity_id),
-            },
-            idempotency_key=f"extract:{source.id}:{episode.guest_entity_id}:{source.checksum}",
+            payload={"source_id": str(source.id), "subject_entity_id": subject_id},
+            idempotency_key=f"extract:{source.id}:{subject_id}:{source.checksum}",
         )

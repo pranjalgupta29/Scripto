@@ -65,14 +65,23 @@ export default function EpisodePage() {
 
       {data.progress && data.progress.pending > 0 ? (
         <Card>
-          <p className="mb-2 text-sm font-medium">Ingesting…</p>
-          <ProgressBar
-            finished={data.progress.finished}
-            total={data.progress.total}
-          />
-          <p className="mt-2 text-xs text-black/50">
-            Sources appear below as they land. You can keep working.
+          <p className="mb-2 text-sm font-medium">
+            {data.progress.stage ?? "Working"}…
           </p>
+          {data.progress.sources_total ? (
+            <>
+              <ProgressBar
+                finished={data.progress.sources_analysed}
+                total={data.progress.sources_total}
+              />
+              <p className="mt-2 text-xs text-black/50">
+                {data.progress.sources_read} of {data.progress.sources_total}{" "}
+                sources read · {data.progress.sources_analysed} analysed. The
+                total can grow when topic research adds sources. You can keep
+                working.
+              </p>
+            </>
+          ) : null}
         </Card>
       ) : null}
 
@@ -219,7 +228,7 @@ function SourcesPanel({
   sources,
 }: {
   episodeId: string;
-  sources: { id: string; title: string | null; url: string | null; status: string; error: string | null; added_by: string; type: string }[];
+  sources: { id: string; title: string | null; url: string | null; status: string; error: string | null; added_by: string; type: string; subject?: string }[];
 }) {
   const queryClient = useQueryClient();
   const [url, setUrl] = useState("");
@@ -284,6 +293,14 @@ function SourcesPanel({
                 <p className="truncate text-xs text-red-700">{source.error}</p>
               ) : null}
             </div>
+            {source.subject === "topic" ? (
+              <span
+                className="shrink-0 rounded border border-sky-200 bg-sky-50 px-1.5 py-0.5 text-[11px] text-sky-800"
+                title="Found for the topic brief, not about the guest"
+              >
+                topic research
+              </span>
+            ) : null}
             <StatusPill status={source.status} />
             <Button variant="danger" onClick={() => remove.mutate(source.id)}>
               Remove
@@ -621,6 +638,7 @@ function ScriptPanel({ episodeId }: { episodeId: string }) {
   const [optimizeOrder, setOptimizeOrder] = useState(true);
   const [includeBonus, setIncludeBonus] = useState(true);
   const [voiceSample, setVoiceSample] = useState("");
+  const [feedback, setFeedback] = useState("");
   const [error, setError] = useState<string | null>(null);
 
   const script = useQuery({
@@ -639,8 +657,10 @@ function ScriptPanel({ episodeId }: { episodeId: string }) {
         optimize_order: optimizeOrder,
         include_bonus: includeBonus,
         voice_sample: voiceSample || undefined,
+        feedback: feedback.trim() || undefined,
       }),
     onSuccess: () => {
+      setFeedback("");
       queryClient.invalidateQueries({ queryKey: ["script", episodeId] });
       queryClient.invalidateQueries({ queryKey: ["episode", episodeId] });
     },
@@ -734,7 +754,22 @@ function ScriptPanel({ episodeId }: { episodeId: string }) {
           onChange={(e) => setVoiceSample(e.target.value)}
         />
 
-        <div className="flex items-center gap-3">
+        {segments.length ? (
+          <div>
+            <p className="mb-1.5 text-xs font-medium text-black/60">
+              What should change?{" "}
+              <span className="font-normal text-black/45">(optional)</span>
+            </p>
+            <Textarea
+              rows={2}
+              placeholder="e.g. push harder on the supplement claims, keep questions shorter, spend more time on focus"
+              value={feedback}
+              onChange={(e) => setFeedback(e.target.value)}
+            />
+          </div>
+        ) : null}
+
+        <div className="flex flex-wrap items-center gap-3">
           <Button
             onClick={() => {
               setError(null);
@@ -744,13 +779,19 @@ function ScriptPanel({ episodeId }: { episodeId: string }) {
           >
             {generate.isPending
               ? "Generating…"
-              : segments.length
-                ? "Regenerate script"
-                : "Generate script"}
+              : !segments.length
+                ? "Generate script"
+                : feedback.trim()
+                  ? "Regenerate with these changes"
+                  : "Regenerate script"}
           </Button>
-          {hasEdits ? (
-            <span className="text-xs text-amber-800">
-              Regenerating replaces your edits.
+          {segments.length ? (
+            <span className="text-xs text-black/50">
+              {feedback.trim()
+                ? "Your note goes to the writer with the current version, so it revises rather than starting over."
+                : hasEdits
+                  ? "Your edited blocks will be kept."
+                  : "Without a note you get a fresh take. The current version stays saved."}
             </span>
           ) : null}
         </div>
@@ -765,6 +806,12 @@ function ScriptPanel({ episodeId }: { episodeId: string }) {
               : "Run of show"}{" "}
             · {script.data?.style_preset}
           </p>
+          {script.data?.feedback ? (
+            <p className="mt-1 text-xs text-black/55">
+              Revised from the previous version. You asked: “
+              {script.data.feedback}”
+            </p>
+          ) : null}
           <div className="mt-3 space-y-3">
             {timeline.map((segment) => (
               <SegmentCard

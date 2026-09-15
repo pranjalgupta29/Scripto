@@ -78,7 +78,8 @@ class Settings(BaseSettings):
     already_covered_min_sources: int = 3
 
     # coverage thresholds -> rich | thin | sparse
-    coverage_rich_min_sources: int = 8
+    # "rich" needs this share of the source limit readable (coverage.rich_min_sources)
+    coverage_rich_share: float = 0.75
     coverage_rich_min_clusters: int = 15
     coverage_thin_min_sources: int = 3
 

@@ -91,8 +91,9 @@ def _check_quota(db: Session, user: User) -> None:
 
 
 def _sources_for(db: Session, episode_id: uuid.UUID) -> list[SourceOut]:
+    topic_id = db.scalar(select(Episode.topic_entity_id).where(Episode.id == episode_id))
     rows = db.execute(
-        select(Source, EpisodeSource.added_by)
+        select(Source, EpisodeSource.added_by, EpisodeSource.subject_entity_id)
         .join(EpisodeSource, EpisodeSource.source_id == Source.id)
         .where(EpisodeSource.episode_id == episode_id, EpisodeSource.removed_at.is_(None))
         .order_by(Source.created_at)
@@ -108,8 +109,9 @@ def _sources_for(db: Session, episode_id: uuid.UUID) -> list[SourceOut]:
             status=s.status,
             error=s.error,
             added_by=added_by,
+            subject="topic" if topic_id and subject_id == topic_id else "guest",
         )
-        for s, added_by in rows
+        for s, added_by, subject_id in rows
     ]
 
 
@@ -274,15 +276,21 @@ def add_source(
 
     episode = _owned_episode(episode_id, db, user)
 
+    # Only sources the host added count here. Discovered sources have their own
+    # allowance and must never stop the host pasting a bio or notes -- the main
+    # remedy for a thin guest.
     current = db.scalar(
         select(func.count(EpisodeSource.id)).where(
-            EpisodeSource.episode_id == episode.id, EpisodeSource.removed_at.is_(None)
+            EpisodeSource.episode_id == episode.id,
+            EpisodeSource.removed_at.is_(None),
+            EpisodeSource.added_by == "user",
         )
     )
     if current and current >= settings.max_sources_per_episode:
         raise HTTPException(
             status.HTTP_429_TOO_MANY_REQUESTS,
-            f"source limit reached ({settings.max_sources_per_episode})",
+            f"you have added the maximum of {settings.max_sources_per_episode} sources "
+            "to this episode",
         )
 
     if body.text:
@@ -304,7 +312,14 @@ def add_source(
             )
             db.add(existing)
             db.flush()
-        db.add(EpisodeSource(episode_id=episode.id, source_id=existing.id, added_by="user"))
+        db.add(
+            EpisodeSource(
+                episode_id=episode.id,
+                source_id=existing.id,
+                added_by="user",
+                subject_entity_id=episode.guest_entity_id,
+            )
+        )
         db.flush()
         queue.enqueue(
             db,
@@ -323,6 +338,7 @@ def add_source(
             source_type=classify_url(canonicalize_url(body.url)),
             added_by="user",
             title=body.title,
+            subject_entity_id=episode.guest_entity_id,
         )
         if source is None:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid url")
@@ -562,6 +578,14 @@ def create_script(
         raw = body.voice_sample.encode()
         voice_ref = get_blob().put(f"voice-{checksum(raw)}", raw)
 
+    # A regenerate revises the latest version; that version is kept.
+    previous = db.scalar(
+        select(Script)
+        .where(Script.episode_id == episode.id)
+        .order_by(Script.created_at.desc())
+        .limit(1)
+    )
+
     script = Script(
         id=uuid.uuid4(),
         episode_id=episode.id,
@@ -569,6 +593,8 @@ def create_script(
         voice_sample_ref=voice_ref,
         model_version=get_llm().version,
         duration_minutes=body.duration_minutes,
+        parent_script_id=previous.id if previous else None,
+        feedback=(body.feedback or "").strip() or None,
     )
     db.add(script)
     db.flush()
@@ -622,6 +648,8 @@ def _script_out(db: Session, script: Script) -> ScriptResponse:
         style_preset=script.style_preset,
         model_version=script.model_version,
         duration_minutes=script.duration_minutes,
+        feedback=script.feedback,
+        parent_script_id=script.parent_script_id,
         created_at=script.created_at,
         segments=[_segment_out(s, citations.get(s.id, [])) for s in segments],
     )

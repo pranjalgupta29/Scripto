@@ -26,6 +26,7 @@ export interface SourceOut {
   status: "pending" | "fetched" | "parsed" | "failed";
   error: string | null;
   added_by: string;
+  subject: "guest" | "topic";
 }
 
 export interface JobProgress {
@@ -34,6 +35,10 @@ export interface JobProgress {
   pending: number;
   by_state: Record<string, number>;
   by_kind: Record<string, Record<string, number>>;
+  sources_total: number;
+  sources_read: number;
+  sources_analysed: number;
+  stage: string | null;
 }
 
 export interface CoverageDetail {
@@ -130,6 +135,8 @@ export interface Script {
   style_preset: string;
   model_version: string;
   duration_minutes: number | null;
+  feedback: string | null;
+  parent_script_id: string | null;
   created_at: string;
   segments: Segment[];
 }

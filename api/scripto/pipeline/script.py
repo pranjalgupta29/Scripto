@@ -154,6 +154,50 @@ def _is_uuid(text: str) -> bool:
     return True
 
 
+def _previous_version_lines(segments: list[ScriptSegment]) -> list[str]:
+    """A compact rendering of the version being revised, for the prompt."""
+    lines: list[str] = []
+    for segment in segments:
+        edited = " (edited by the host)" if segment.edited_by_user else ""
+        title = f" {segment.title}" if segment.title else ""
+        lines.append(f"- [{segment.segment_type}]{title}{edited}")
+        if segment.transition_in:
+            lines.append(f"    transition: {segment.transition_in}")
+        lines.append(f"    question: {segment.question}")
+        for question in segment.deeper_questions or []:
+            lines.append(f"    deeper: {question}")
+    return lines
+
+
+def _carry_over_host_edits(rows: list[dict], parent_segments: list[ScriptSegment]) -> None:
+    """On a plain regenerate, blocks the host edited keep the host's words.
+
+    Enforced in code rather than trusted to the prompt. With feedback the model
+    decides, because the feedback may ask for exactly those blocks to change.
+    """
+
+    def key(segment_type, topic_id) -> tuple:
+        return (segment_type, str(topic_id) if topic_id else None)
+
+    edited = {
+        key(s.segment_type, s.topic_id): s
+        for s in parent_segments
+        if s.edited_by_user and s.segment_type != "bonus"
+    }
+    for row in rows:
+        previous = edited.get(key(row["segment_type"], row.get("topic_id")))
+        if previous is None:
+            continue
+        row["question"] = previous.question
+        if previous.transition_in:
+            row["transition_in"] = previous.transition_in
+        if previous.host_script:
+            row["host_script"] = previous.host_script
+        if previous.deeper_questions:
+            row["deeper_questions"] = list(previous.deeper_questions)
+        row["edited_by_user"] = True
+
+
 @register("generate_script")
 def run_generate_script(db: Session, job: Job) -> None:
     episode = db.get(Episode, job.episode_id)
@@ -193,6 +237,18 @@ def run_generate_script(db: Session, job: Job) -> None:
     ]
     covered = [c.canonical_text for c in already_covered(db, subject.id)]
 
+    # Regeneration: revise the latest version rather than starting blind.
+    parent_segments: list[ScriptSegment] = []
+    if script.parent_script_id:
+        parent_segments = list(
+            db.scalars(
+                select(ScriptSegment)
+                .where(ScriptSegment.script_id == script.parent_script_id)
+                .order_by(ScriptSegment.ordinal)
+            )
+        )
+    feedback = _text(script.feedback)
+
     optimize_order = bool(job.payload.get("optimize_order", True))
     include_bonus = bool(job.payload.get("include_bonus", True))
     plan = plan_run_of_show(script.duration_minutes or 60, len(topics), script.style_preset)
@@ -213,6 +269,8 @@ def run_generate_script(db: Session, job: Job) -> None:
                 already_covered=covered,
                 optimize_order=optimize_order,
                 include_bonus=include_bonus,
+                previous_version=_previous_version_lines(parent_segments) or None,
+                feedback=feedback,
             ),
             schema=SCRIPT_SCHEMA,
         )
@@ -348,6 +406,9 @@ def run_generate_script(db: Session, job: Job) -> None:
                 "claim_ids": cited(block.get("claim_ids")),
             }
         )
+
+    if parent_segments and feedback is None:
+        _carry_over_host_edits(rows, parent_segments)
 
     for ordinal, row in enumerate(rows):
         claim_ids = row.pop("claim_ids")

@@ -135,6 +135,7 @@ export const api = {
       optimize_order?: boolean;
       include_bonus?: boolean;
       voice_sample?: string;
+      feedback?: string;
     },
   ) =>
     request<Script>(`/episodes/${id}/script`, {
