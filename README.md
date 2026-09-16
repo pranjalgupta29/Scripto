@@ -30,6 +30,11 @@ runs and is testable with **no API keys and no network**.
 
 ## Running it
 
+Setting this up on a new machine — Postgres, pgvector, the database, the `.env`
+files, and what to do when it won't start — is in
+[`docs/setup.md`](docs/setup.md). **No API keys are needed:** every provider has
+a fake implementation and the defaults use them.
+
 Postgres 16 with pgvector must be reachable at `DATABASE_URL`. On this machine it
 runs via Homebrew on **port 5433** (5432 is occupied by an existing EDB install):
 
