@@ -92,13 +92,13 @@ export default function PrepPage({ params }: { params: { token: string } }) {
   return (
     <div className="mx-auto max-w-xl">
       <h1 className="text-2xl font-semibold tracking-tight">
-        A few questions before we record
+        Before we record — what would you like to talk about?
       </h1>
       <p className="mt-2 text-sm text-black/60">
         You are a guest on{" "}
-        <span className="font-medium">{data.episode_title}</span>. Your host
-        wrote these after reading up on you. Answer what you like, skip what you
-        do not — every line they write from your answers will cite you.
+        <span className="font-medium">{data.episode_title}</span>. These are here
+        to shape the conversation, not to preview it — your host will bring their
+        own questions on the day. Answer what you like, skip what you do not.
       </p>
 
       {sent ? (

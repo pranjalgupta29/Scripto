@@ -1142,6 +1142,84 @@ def test_prep_notes_need_content_and_refuse_linkedin_profiles(auth_client):
     assert "Save to PDF" in profile.json()["detail"]
 
 
+def _record_script_prompts(monkeypatch) -> list[str]:
+    import scripto.pipeline.script as script_pipeline
+
+    prompts: list[str] = []
+    original = script_pipeline.script_prompt
+
+    def recording(**kwargs):
+        prompt = original(**kwargs)
+        prompts.append(prompt)
+        return prompt
+
+    monkeypatch.setattr(script_pipeline, "script_prompt", recording)
+    return prompts
+
+
+def test_a_script_can_be_rebuilt_from_what_the_guest_sent(auth_client, monkeypatch):
+    """The guest's stated appetite is preference, not research: opt-in, and never
+    asserted as fact."""
+    prompts = _record_script_prompts(monkeypatch)
+
+    episode_id = _ready_episode(auth_client)
+    token = _published_prep_link(auth_client, episode_id)
+    guest = _guest_client()
+    asked = guest.get(f"/prep/{token}").json()["questions"][0]["text"]
+    sent = guest.post(
+        f"/prep/{token}/answers",
+        json={
+            "answers": [
+                {
+                    "question": asked,
+                    "answer": "Spend most of the time on liquidity risk, and skip "
+                    "the 2019 merger entirely.",
+                }
+            ]
+        },
+    )
+    assert sent.status_code == 201, sent.text
+    drain()
+
+    # Default: no preference block. Their answers are a source like any other, so
+    # the words themselves may still reach the writer as cited research -- what
+    # must not happen by default is treating them as instructions.
+    auth_client.post(
+        f"/episodes/{episode_id}/script", json={"style_preset": "conversational"}
+    )
+    drain()
+    assert "What the guest said" not in prompts[-1]
+    assert auth_client.get(f"/episodes/{episode_id}/script").json()["guest_prep_used"] is False
+
+    # Opted in: handed over, and labelled as preference rather than evidence.
+    auth_client.post(
+        f"/episodes/{episode_id}/script",
+        json={"style_preset": "conversational", "use_guest_prep": True},
+    )
+    drain()
+    assert "What the guest said" in prompts[-1]
+    assert "skip the 2019 merger" in prompts[-1]
+    assert "preference, not evidence" in prompts[-1]
+    assert auth_client.get(f"/episodes/{episode_id}/script").json()["guest_prep_used"] is True
+
+
+def test_asking_for_guest_input_when_there_is_none_changes_nothing(auth_client, monkeypatch):
+    """A run-of-show must never imply the guest weighed in when they did not."""
+    prompts = _record_script_prompts(monkeypatch)
+
+    episode_id = _ready_episode(auth_client)
+    created = auth_client.post(
+        f"/episodes/{episode_id}/script",
+        json={"style_preset": "conversational", "use_guest_prep": True},
+    )
+    assert created.status_code == 202, created.text
+    drain()
+
+    assert "What the guest said" not in prompts[-1]
+    script = auth_client.get(f"/episodes/{episode_id}/script").json()
+    assert script["segments"], "the script still generates normally"
+
+
 def test_prep_questions_are_drafted_from_research_then_approved(auth_client):
     """The host edits a draft grounded in the research, and approves it."""
     episode_id = _ready_episode(auth_client)

@@ -20,11 +20,41 @@ from scripto.llm.prompts import (
     PREP_STYLE_BRIEFS,
     prep_questions_prompt,
 )
-from scripto.models import DossierItem, Entity, Episode, Topic
+from scripto.models import Chunk, DossierItem, Entity, Episode, EpisodeSource, Source, Topic
 from scripto.pipeline.suggest import _valid_claim_ids
 
 MAX_QUESTIONS = 6
 DEFAULT_STYLE = "conversational"
+
+# Enough of the guest's own words to steer a run-of-show without crowding out
+# the research in the prompt.
+GUEST_PREP_CHARS = 3000
+
+
+def guest_prep_text(db: Session, episode: Episode) -> str | None:
+    """What the guest said they want, in their own words, or None if nothing.
+
+    Their answers are already a source, cited like any other. This hands the
+    same material to the script writer as *preference* -- what to spend time on,
+    what to avoid -- which is not something a claim can express.
+    """
+    rows = (
+        db.execute(
+            select(Chunk.text)
+            .join(Source, Source.id == Chunk.source_id)
+            .join(EpisodeSource, EpisodeSource.source_id == Source.id)
+            .where(
+                EpisodeSource.episode_id == episode.id,
+                EpisodeSource.added_by == "guest",
+                EpisodeSource.removed_at.is_(None),
+            )
+            .order_by(Source.created_at, Chunk.ordinal)
+        )
+        .scalars()
+        .all()
+    )
+    text = "\n\n".join(t.strip() for t in rows if t and t.strip())
+    return text[:GUEST_PREP_CHARS] or None
 
 
 def suggest_prep_questions(db: Session, episode: Episode, style: str) -> list[dict]:

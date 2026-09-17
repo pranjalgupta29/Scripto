@@ -330,7 +330,10 @@ questions you could ask anyone in their field. Cite the claim ids each block res
 research, and a warm-up first question.
 - The closing has a transition, a final question, and a one-line wrap-up.
 - Set risk_flags where the guest has already answered something repeatedly \
-elsewhere, or where a topic is commercially or legally sensitive for them."""
+elsewhere, or where a topic is commercially or legally sensitive for them.
+- When the guest's own prep answers are supplied, let them shape emphasis, order \
+and what to avoid. They are preferences, not evidence: never assert anything from \
+them as fact without a claim id to cite."""
 
 _ID_LIST: dict[str, Any] = {"type": "array", "items": {"type": "string"}}
 _TEXT_LIST: dict[str, Any] = {"type": "array", "items": {"type": "string"}}
@@ -431,6 +434,7 @@ def script_prompt(
     include_bonus: bool,
     previous_version: list[str] | None = None,
     feedback: str | None = None,
+    guest_notes: str | None = None,
 ) -> str:
     lines = [
         f"Episode title: {episode_title}",
@@ -490,6 +494,18 @@ def script_prompt(
                 "edited by the host will be kept as they are.",
             ]
 
+    if guest_notes:
+        lines += [
+            "",
+            "What the guest said when the host asked them (their own words, not "
+            "research):",
+            guest_notes,
+            "",
+            "Use this to choose what to spend time on, what order to take it in, and "
+            "what to leave alone. It is preference, not evidence: nothing here may be "
+            "stated as fact unless a cited claim says it too.",
+        ]
+
     if include_bonus:
         lines += [
             "",
@@ -539,22 +555,28 @@ def voice_prompt(transcript: str) -> str:
 # topic suggestions
 # --------------------------------------------------------------------------
 
-PREP_QUESTIONS_SYSTEM = """You write the short questionnaire a podcast host sends a \
-guest before recording. The guest is a busy person doing the host a favour, so the \
-questionnaire must feel worth their time.
+PREP_QUESTIONS_SYSTEM = """You write the short intake form a podcast host sends a \
+guest before recording. Its purpose is to learn what the guest wants from the \
+conversation. It is not a rehearsal of the interview.
 
 Rules:
-- Ask what the host cannot find out by research. Never ask something the research \
-already answers.
-- Where the research gives you something specific, use it: a question that shows you \
-did your homework earns a better answer than a generic one. Cite the claim ids such \
-a question rests on.
-- Questions that simply suit the format are fine; give those an empty claim_ids list.
-- Write questions the guest can answer in a few sentences. No compound questions, no \
-interrogation, nothing that reads like a form.
-- A question may refer only to what the cited claims literally say. Do not infer a \
-background, a motive or a history the claims do not state: asking someone about a \
-career they never had is worse than asking nothing.
+- Never write a question the host would ask on air. Ask about direction and appetite: \
+what they want to spend time on, what they are tired of being asked, what they would \
+rather avoid, what they are working on now, what they wish people understood.
+- Do not reveal what the research turned up. A sharp angle, a contradiction or a \
+surprise is worth nothing once the guest can prepare for it. Where the research guides \
+you, keep the wording broad -- name a subject area at most, never the specific finding.
+- Keep them open. A good intake question has many possible answers and lets the guest \
+choose the ground. A question with one obvious answer belongs in the interview instead.
+- Ask what the host cannot find out by research. Never ask what the research already \
+answers.
+- Any detail you do mention must come from the cited claims and nothing else. Never \
+infer a background, a motive or a history the claims do not state: asking someone \
+about a career they never had is worse than asking nothing.
+- Cite the claim ids behind any question the research shaped. Questions that simply \
+suit the format are fine; give those an empty claim_ids list.
+- Short enough to answer in a few sentences. No compound questions, nothing that reads \
+like a form.
 - Address the guest directly as "you"."""
 
 PREP_QUESTIONS_SCHEMA: dict[str, Any] = {
@@ -580,16 +602,17 @@ PREP_QUESTIONS_SCHEMA: dict[str, Any] = {
     },
 }
 
-# What each kind of show wants to know before it starts.
+# What each kind of show needs to find out before it starts. These describe what to
+# learn about the guest's appetite, not what to ask them on air.
 PREP_STYLE_BRIEFS = {
-    "conversational": "Warm and personal. Passions, formative moments, what they are "
-    "excited about right now, and anything they have been wanting to talk about.",
-    "formal": "Professional and precise. Decisions they owned, evidence behind their "
-    "positions, and the parts of their work that are easy to get wrong.",
-    "contrarian": "Invites disagreement. Where they think the consensus is wrong, what "
-    "they would defend under pressure, and criticism they think is fair.",
-    "educational": "Explanatory. What listeners most often misunderstand, what they "
-    "would teach first, and the example they always reach for.",
+    "conversational": "Find out what they are passionate about, what has shaped them, "
+    "and which parts of their life they actually enjoy talking about.",
+    "formal": "Find out which decisions and results they are willing to go into detail "
+    "on, and where they have to be careful about what they can say.",
+    "contrarian": "Find out which arguments they enjoy having, where they welcome "
+    "pushback, and which criticisms they think are worth taking seriously.",
+    "educational": "Find out what they most like explaining, which misunderstandings "
+    "frustrate them, and who they picture themselves teaching.",
 }
 
 
@@ -617,7 +640,8 @@ def prep_questions_prompt(
         lines += ["", "There is no research yet. Ask what would help most from scratch."]
     lines += [
         "",
-        "Write up to 6 questions for the guest, each citing any claim ids it rests on.",
+        "Write up to 6 intake questions for the guest. Cite the claim ids behind any "
+        "question the research shaped -- the host sees those, the guest never does.",
     ]
     return "\n".join(lines)
 

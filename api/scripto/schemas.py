@@ -256,6 +256,13 @@ class CreateScriptRequest(BaseModel):
         max_length=2000,
         description="What should change compared with the current version.",
     )
+    use_guest_prep: bool = Field(
+        default=False,
+        description=(
+            "Let what the guest sent through the prep link shape emphasis, order "
+            "and what to avoid. Ignored when the guest has sent nothing."
+        ),
+    )
 
 
 class SegmentOut(BaseModel):
@@ -287,6 +294,7 @@ class ScriptResponse(BaseModel):
     duration_minutes: int | None = None
     feedback: str | None = None
     parent_script_id: uuid.UUID | None = None
+    guest_prep_used: bool = False
     created_at: datetime
     segments: list[SegmentOut]
 

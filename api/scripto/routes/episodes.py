@@ -727,6 +727,7 @@ def create_script(
         duration_minutes=body.duration_minutes,
         parent_script_id=previous.id if previous else None,
         feedback=(body.feedback or "").strip() or None,
+        guest_prep_used=body.use_guest_prep,
     )
     db.add(script)
     db.flush()
@@ -782,6 +783,7 @@ def _script_out(db: Session, script: Script) -> ScriptResponse:
         duration_minutes=script.duration_minutes,
         feedback=script.feedback,
         parent_script_id=script.parent_script_id,
+        guest_prep_used=script.guest_prep_used,
         created_at=script.created_at,
         segments=[_segment_out(s, citations.get(s.id, [])) for s in segments],
     )

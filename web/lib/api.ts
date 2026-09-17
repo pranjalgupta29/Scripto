@@ -227,6 +227,7 @@ export const api = {
       include_bonus?: boolean;
       voice_sample?: string;
       feedback?: string;
+      use_guest_prep?: boolean;
     },
   ) =>
     request<Script>(`/episodes/${id}/script`, {

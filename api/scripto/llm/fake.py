@@ -263,21 +263,29 @@ class FakeProvider(LLMProvider):
         }
 
     def _task_suggest_prep_questions(self, prompt: str) -> dict[str, Any]:
-        """Questions grounded in the research, plus one that suits the format."""
+        """Intake questions: what the guest wants from the conversation.
+
+        These name a subject area at most. They never quote the finding behind
+        them -- an intake form that previews the interview costs the host every
+        surprise they researched.
+        """
         pairs = re.findall(
             r"^\[([0-9a-f-]{36})\](?:\s*\([^)]*\))?\s*(.+)$", prompt, re.MULTILINE
         )
         questions = [
             {
-                "text": f"Can you tell us more about: {text.strip()[:60]}?",
-                "why": "Grounded in the research.",
+                "text": (
+                    "How much of the conversation would you like to spend on "
+                    f"{' '.join(text.split()[:5]).rstrip('.,')}?"
+                ),
+                "why": "The research says there is material here; this asks their appetite.",
                 "claim_ids": [claim_id],
             }
             for claim_id, text in pairs[:3]
         ]
         questions.append(
             {
-                "text": "What are you most excited about right now?",
+                "text": "What have you been asked too many times already?",
                 "why": "Suits the format; not researched.",
                 "claim_ids": [],
             }

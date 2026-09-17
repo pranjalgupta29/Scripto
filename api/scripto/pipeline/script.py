@@ -43,6 +43,7 @@ from scripto.models import (
     Topic,
 )
 from scripto.pipeline.cluster import already_covered
+from scripto.pipeline.prep import guest_prep_text
 
 STYLE_PRESETS = ("formal", "conversational", "contrarian", "educational")
 
@@ -253,6 +254,11 @@ def run_generate_script(db: Session, job: Job) -> None:
     include_bonus = bool(job.payload.get("include_bonus", True))
     plan = plan_run_of_show(script.duration_minutes or 60, len(topics), script.style_preset)
 
+    # Only when the host asked for it, and only if the guest actually sent
+    # something: a run-of-show must never imply the guest weighed in when they
+    # did not.
+    guest_notes = guest_prep_text(db, episode) if script.guest_prep_used else None
+
     with provider_slot("llm"):
         payload = get_llm().complete_json(
             role="compose",
@@ -271,6 +277,7 @@ def run_generate_script(db: Session, job: Job) -> None:
                 include_bonus=include_bonus,
                 previous_version=_previous_version_lines(parent_segments) or None,
                 feedback=feedback,
+                guest_notes=guest_notes,
             ),
             schema=SCRIPT_SCHEMA,
         )

@@ -169,6 +169,7 @@ export interface Script {
   duration_minutes: number | null;
   feedback: string | null;
   parent_script_id: string | null;
+  guest_prep_used: boolean;
   created_at: string;
   segments: Segment[];
 }

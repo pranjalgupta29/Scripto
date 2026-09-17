@@ -527,11 +527,17 @@ Search cannot reach the one source that knows most: the guest. This is the
 remedy, and the answer to a guest with little material online.
 
 1. **Draft** (`POST /episodes/{id}/prep-questions/suggest?style=…`, inline, one
-   compose call). Questions are grounded in the dossier the research already
-   produced, each citing the claim ids it rests on, and shaped by the kind of
-   show — `conversational`, `formal`, `contrarian`, `educational`, the same
-   vocabulary the script uses. Ungrounded questions that merely suit the format
-   are allowed and labelled `format`. Nothing is stored.
+   compose call). These are **intake questions, not interview questions**: they
+   ask what the guest wants from the conversation — what to spend time on, what
+   they are tired of, what to avoid — so the host learns the guest's appetite
+   while keeping their own angles unseen. A prep form that previews the interview
+   costs the host every surprise the research bought them, so the prompt forbids
+   naming what the research found: a question may reference a subject area at
+   most, never the finding. Drafts are grounded in the dossier and cite the claim
+   ids behind them for the host's eyes, shaped by the kind of show —
+   `conversational`, `formal`, `contrarian`, `educational`, the same vocabulary
+   the script uses. Questions that merely suit the format are labelled `format`.
+   Nothing is stored.
 2. **Approve** (`PUT /episodes/{id}/prep-questions`). The host edits, adds,
    removes, and saves. Only then are the questions the host's own.
 3. **Publish** (`POST /episodes/{id}/prep-link`). Refused with `409` until a
@@ -543,6 +549,16 @@ remedy, and the answer to a guest with little material online.
    the claim ids, the dossier or the script. They answer questions
    (`/answers`), attach a CV or bio (`/upload`), and add links or anything else
    (`/notes`).
+
+**Feeding the script.** A run-of-show can be rebuilt from what the guest sent:
+`POST /episodes/{id}/script` with `use_guest_prep: true` hands their own words to
+the writer as *preference* — what to spend time on, what order, what to leave
+alone — which is not something a claim can express. It is opt-in, the UI offers it
+only once the guest has actually submitted something, and asking for it when
+nothing was sent changes nothing: a run-of-show must never imply the guest weighed
+in when they did not. `scripts.guest_prep_used` records it, and the prompt states
+plainly that preference is not evidence — nothing from it may be asserted as fact
+without a cited claim.
 
 Everything the guest sends becomes an ordinary source, `added_by = "guest"`, with
 its own allowance separate from the host's, so guest material can never be
@@ -1227,7 +1243,7 @@ the same code can be deployed unchanged.
 
 ## 14. Testing, provider checks and evals
 
-### Tests — `api/tests/`, 105 of them
+### Tests — `api/tests/`, 107 of them
 
 | File | What it covers |
 |---|---|

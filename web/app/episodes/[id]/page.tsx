@@ -104,7 +104,12 @@ export default function EpisodePage() {
             busy={(data.progress?.pending ?? 0) > 0}
           />
           <TopicsPanel episodeId={id} />
-          <ScriptPanel episodeId={id} />
+          <ScriptPanel
+            episodeId={id}
+            guestSubmissions={
+              data.sources.filter((s) => s.added_by === "guest").length
+            }
+          />
         </>
       )}
     </div>
@@ -425,22 +430,22 @@ const PREP_STYLES: { value: string; label: string; hint: string }[] = [
   {
     value: "conversational",
     label: "Conversational",
-    hint: "passions, formative moments, what they are excited by now",
+    hint: "what they are passionate about and enjoy talking about",
   },
   {
     value: "formal",
     label: "Formal",
-    hint: "decisions they owned, evidence behind their positions",
+    hint: "what they will go into detail on, and where they must be careful",
   },
   {
     value: "contrarian",
     label: "Contrarian",
-    hint: "where they think the consensus is wrong",
+    hint: "which arguments they enjoy, where they welcome pushback",
   },
   {
     value: "educational",
     label: "Educational",
-    hint: "what listeners misunderstand, what they would teach first",
+    hint: "what they like explaining, which misunderstandings frustrate them",
   },
 ];
 
@@ -517,8 +522,10 @@ function PrepLinkRow({ episodeId }: { episodeId: string }) {
     <div className="mt-4 border-t border-black/10 pt-4">
       <p className="text-sm font-medium">Ask the guest</p>
       <p className="mt-0.5 text-xs text-black/50">
-        Draft questions from the research, edit them, then send one link. The
-        guest answers and can attach a CV — no account needed.
+        Broad questions about what they want from the conversation — never the
+        ones you plan to ask on air, so the interview keeps its surprises.
+        Drafted from the research, edited by you, then sent as one link. The
+        guest answers and can attach a CV; no account needed.
       </p>
 
       <div className="mt-3 flex flex-wrap items-center gap-2">
@@ -985,12 +992,19 @@ function Chip({
   );
 }
 
-function ScriptPanel({ episodeId }: { episodeId: string }) {
+function ScriptPanel({
+  episodeId,
+  guestSubmissions,
+}: {
+  episodeId: string;
+  guestSubmissions: number;
+}) {
   const queryClient = useQueryClient();
   const [style, setStyle] = useState("conversational");
   const [duration, setDuration] = useState(60);
   const [optimizeOrder, setOptimizeOrder] = useState(true);
   const [includeBonus, setIncludeBonus] = useState(true);
+  const [useGuestPrep, setUseGuestPrep] = useState(false);
   const [voiceSample, setVoiceSample] = useState("");
   const [feedback, setFeedback] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -1012,6 +1026,7 @@ function ScriptPanel({ episodeId }: { episodeId: string }) {
         include_bonus: includeBonus,
         voice_sample: voiceSample || undefined,
         feedback: feedback.trim() || undefined,
+        use_guest_prep: useGuestPrep,
       }),
     onSuccess: () => {
       setFeedback("");
@@ -1099,6 +1114,19 @@ function ScriptPanel({ episodeId }: { episodeId: string }) {
             />
             Include backup topics for when a block runs short
           </label>
+          {/* Only offered once the guest has actually sent something. */}
+          {guestSubmissions > 0 ? (
+            <label className="flex items-center gap-2 text-xs text-black/70">
+              <input
+                type="checkbox"
+                checked={useGuestPrep}
+                onChange={(e) => setUseGuestPrep(e.target.checked)}
+              />
+              Use what the guest sent ({guestSubmissions}
+              {guestSubmissions === 1 ? " submission" : " submissions"}) to shape
+              emphasis and order
+            </label>
+          ) : null}
         </div>
 
         <Textarea
@@ -1164,6 +1192,11 @@ function ScriptPanel({ episodeId }: { episodeId: string }) {
             <p className="mt-1 text-xs text-black/55">
               Revised from the previous version. You asked: “
               {script.data.feedback}”
+            </p>
+          ) : null}
+          {script.data?.guest_prep_used ? (
+            <p className="mt-1 text-xs text-emerald-800">
+              Shaped by what the guest sent through the prep link.
             </p>
           ) : null}
           <div className="mt-3 space-y-3">

@@ -381,6 +381,9 @@ class Script(Base, TimestampMixin):
         ForeignKey("scripts.id", ondelete="SET NULL")
     )
     feedback: Mapped[str | None] = mapped_column(Text)
+    # Built with what the guest sent through the prep link: their stated
+    # appetite shapes emphasis and order, never what is asserted as fact.
+    guest_prep_used: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
 
 class ScriptSegment(Base):
