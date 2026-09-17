@@ -6,7 +6,12 @@ import { useParams } from "next/navigation";
 import { useEffect, useState } from "react";
 
 import { ApiError, api } from "@/lib/api";
-import { SECTION_TITLES, type Candidate, type Segment } from "@/lib/types";
+import {
+  SECTION_TITLES,
+  type Candidate,
+  type PrepQuestion,
+  type Segment,
+} from "@/lib/types";
 import {
   Button,
   Card,
@@ -231,7 +236,7 @@ function SourcesPanel({
   sources,
 }: {
   episodeId: string;
-  sources: { id: string; title: string | null; url: string | null; status: string; error: string | null; added_by: string; type: string; subject?: string; topic?: string | null }[];
+  sources: { id: string; title: string | null; url: string | null; status: string; error: string | null; added_by: string; type: string; subject?: string; topic?: string | null; identity?: string | null }[];
 }) {
   const queryClient = useQueryClient();
   const [url, setUrl] = useState("");
@@ -259,6 +264,12 @@ function SourcesPanel({
       setPasted("");
       invalidate();
     },
+    onError: (e: ApiError) => setError(e.message),
+  });
+
+  const upload = useMutation({
+    mutationFn: (file: File) => api.uploadSource(episodeId, file),
+    onSuccess: invalidate,
     onError: (e: ApiError) => setError(e.message),
   });
 
@@ -306,6 +317,22 @@ function SourcesPanel({
                 }
               >
                 {source.topic ? `topic: ${source.topic}` : "topic research"}
+              </span>
+            ) : null}
+            {source.identity === "mismatch" ? (
+              <span
+                className="shrink-0 rounded border border-red-200 bg-red-50 px-1.5 py-0.5 text-[11px] text-red-800"
+                title="Someone else with the same name. Nothing was taken from this page."
+              >
+                not this person
+              </span>
+            ) : null}
+            {source.added_by === "guest" ? (
+              <span
+                className="shrink-0 rounded border border-emerald-200 bg-emerald-50 px-1.5 py-0.5 text-[11px] text-emerald-800"
+                title="Sent by the guest through the prep link"
+              >
+                from guest
               </span>
             ) : null}
             <StatusPill status={source.status} />
@@ -362,8 +389,294 @@ function SourcesPanel({
             Add text
           </Button>
         </form>
+
+        <label className="flex cursor-pointer items-center justify-center rounded border border-dashed border-black/20 px-3 py-4 text-center text-sm text-black/55 hover:border-black/40 sm:col-span-2">
+          <input
+            type="file"
+            accept=".pdf,.docx,.txt,.md"
+            className="hidden"
+            disabled={upload.isPending}
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              e.target.value = ""; // so the same file can be chosen again
+              if (!file) return;
+              setError(null);
+              upload.mutate(file);
+            }}
+          />
+          {upload.isPending
+            ? "Uploading…"
+            : "Upload a resume, bio, transcript or notes — PDF, Word, .txt or .md"}
+        </label>
+
+        <p className="text-xs text-black/45 sm:col-span-2">
+          LinkedIn profile pages cannot be read: LinkedIn blocks it. Open the
+          profile, choose More → Save to PDF, and upload that file instead.
+          LinkedIn articles and posts work as URLs.
+        </p>
       </div>
+
+      <PrepLinkRow episodeId={episodeId} />
     </Card>
+  );
+}
+
+const PREP_STYLES: { value: string; label: string; hint: string }[] = [
+  {
+    value: "conversational",
+    label: "Conversational",
+    hint: "passions, formative moments, what they are excited by now",
+  },
+  {
+    value: "formal",
+    label: "Formal",
+    hint: "decisions they owned, evidence behind their positions",
+  },
+  {
+    value: "contrarian",
+    label: "Contrarian",
+    hint: "where they think the consensus is wrong",
+  },
+  {
+    value: "educational",
+    label: "Educational",
+    hint: "what listeners misunderstand, what they would teach first",
+  },
+];
+
+/**
+ * Ask the guest — the one source no search can reach. The questionnaire is
+ * drafted from the research, edited by the host, and only then published.
+ */
+function PrepLinkRow({ episodeId }: { episodeId: string }) {
+  const queryClient = useQueryClient();
+  const [copied, setCopied] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [style, setStyle] = useState("conversational");
+  const [questions, setQuestions] = useState<PrepQuestion[] | null>(null);
+  const [unsaved, setUnsaved] = useState(false);
+
+  const saved = useQuery({
+    queryKey: ["prep-questions", episodeId],
+    queryFn: () => api.getPrepQuestions(episodeId),
+  });
+  const link = useQuery({
+    queryKey: ["prep-link", episodeId],
+    queryFn: () => api.getPrepLink(episodeId),
+  });
+
+  // Show what was approved earlier instead of starting blank.
+  useEffect(() => {
+    if (questions !== null || !saved.data) return;
+    setQuestions(saved.data.questions);
+    setStyle(saved.data.style);
+  }, [saved.data, questions]);
+
+  const draft = useMutation({
+    mutationFn: () => api.suggestPrepQuestions(episodeId, style),
+    onSuccess: (data) => {
+      setQuestions(data.questions);
+      setUnsaved(true);
+    },
+    onError: (e: ApiError) => setError(e.message),
+  });
+
+  const save = useMutation({
+    mutationFn: () => api.savePrepQuestions(episodeId, style, questions ?? []),
+    onSuccess: (data) => {
+      setQuestions(data.questions);
+      setUnsaved(false);
+      queryClient.invalidateQueries({ queryKey: ["prep-questions", episodeId] });
+    },
+    onError: (e: ApiError) => setError(e.message),
+  });
+
+  const refreshLink = () =>
+    queryClient.invalidateQueries({ queryKey: ["prep-link", episodeId] });
+  const create = useMutation({
+    mutationFn: () => api.createPrepLink(episodeId),
+    onSuccess: refreshLink,
+    onError: (e: ApiError) => setError(e.message),
+  });
+  const revoke = useMutation({
+    mutationFn: () => api.revokePrepLink(episodeId),
+    onSuccess: refreshLink,
+  });
+
+  const list = questions ?? [];
+  const approved = (saved.data?.questions.length ?? 0) > 0;
+  const origin = typeof window === "undefined" ? "" : window.location.origin;
+  const url = link.data ? `${origin}${link.data.path}` : null;
+
+  const edit = (index: number, text: string) => {
+    setQuestions(list.map((q, i) => (i === index ? { ...q, text } : q)));
+    setUnsaved(true);
+  };
+
+  return (
+    <div className="mt-4 border-t border-black/10 pt-4">
+      <p className="text-sm font-medium">Ask the guest</p>
+      <p className="mt-0.5 text-xs text-black/50">
+        Draft questions from the research, edit them, then send one link. The
+        guest answers and can attach a CV — no account needed.
+      </p>
+
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        {PREP_STYLES.map((preset) => (
+          <button
+            key={preset.value}
+            type="button"
+            title={preset.hint}
+            onClick={() => {
+              setStyle(preset.value);
+              setUnsaved(true);
+            }}
+            className={`rounded-full border px-3 py-1 text-xs transition ${
+              style === preset.value
+                ? "border-ink bg-ink text-white"
+                : "border-black/15 hover:bg-black/5"
+            }`}
+          >
+            {preset.label}
+          </button>
+        ))}
+        <Button
+          variant="ghost"
+          onClick={() => {
+            setError(null);
+            draft.mutate();
+          }}
+          disabled={draft.isPending}
+        >
+          {draft.isPending
+            ? "Drafting…"
+            : list.length
+              ? "Redraft from research"
+              : "Draft questions"}
+        </Button>
+      </div>
+
+      {error ? <p className="mt-3 text-sm text-red-700">{error}</p> : null}
+
+      {list.length ? (
+        <div className="mt-3 space-y-2">
+          {list.map((question, index) => (
+            <div key={index}>
+              <div className="flex items-start gap-2">
+                <Textarea
+                  rows={2}
+                  value={question.text}
+                  onChange={(e) => edit(index, e.target.value)}
+                />
+                <div className="flex shrink-0 flex-col items-end gap-1">
+                  <Button
+                    variant="danger"
+                    onClick={() => {
+                      setQuestions(list.filter((_, i) => i !== index));
+                      setUnsaved(true);
+                    }}
+                  >
+                    Remove
+                  </Button>
+                  {question.basis === "research" ? (
+                    <span
+                      className="rounded border border-emerald-200 bg-emerald-50 px-1.5 py-0.5 text-[11px] text-emerald-800"
+                      title={question.why ?? "Grounded in the research"}
+                    >
+                      from research
+                    </span>
+                  ) : null}
+                </div>
+              </div>
+              {/* The evidence, so a question that asserts more than its source
+                  says is visible before it reaches the guest. */}
+              {question.citations?.length ? (
+                <p className="mt-1 pr-24 text-xs text-black/45">
+                  “{question.citations[0].quote}”
+                  {question.citations[0].source_title
+                    ? ` — ${question.citations[0].source_title}`
+                    : null}
+                </p>
+              ) : null}
+            </div>
+          ))}
+
+          <div className="flex items-center gap-2">
+            <Button
+              variant="ghost"
+              onClick={() => {
+                setQuestions([
+                  ...list,
+                  { text: "", why: null, basis: "host", claim_ids: [] },
+                ]);
+                setUnsaved(true);
+              }}
+            >
+              Add a question
+            </Button>
+            <Button
+              onClick={() => {
+                setError(null);
+                save.mutate();
+              }}
+              disabled={save.isPending || !list.some((q) => q.text.trim())}
+            >
+              {save.isPending
+                ? "Saving…"
+                : unsaved
+                  ? "Save questionnaire"
+                  : "Saved"}
+            </Button>
+          </div>
+        </div>
+      ) : null}
+
+      <div className="mt-4 flex items-center justify-between gap-3">
+        {url ? (
+          <>
+            <code className="min-w-0 flex-1 truncate rounded border border-black/10 bg-black/[0.03] px-2 py-1.5 text-xs">
+              {url}
+            </code>
+            <Button
+              variant="ghost"
+              onClick={() => {
+                navigator.clipboard?.writeText(url);
+                setCopied(true);
+                window.setTimeout(() => setCopied(false), 1500);
+              }}
+            >
+              {copied ? "Copied" : "Copy"}
+            </Button>
+            <Button variant="danger" onClick={() => revoke.mutate()}>
+              Revoke
+            </Button>
+          </>
+        ) : (
+          <>
+            <p className="text-xs text-black/45">
+              {approved
+                ? "Ready to send."
+                : "Save a questionnaire to create the link."}
+            </p>
+            <Button
+              variant="ghost"
+              onClick={() => {
+                setError(null);
+                create.mutate();
+              }}
+              disabled={!approved || create.isPending}
+            >
+              Create link
+            </Button>
+          </>
+        )}
+      </div>
+      {url && unsaved ? (
+        <p className="mt-2 text-xs text-amber-700">
+          Unsaved edits. Save to change what the guest sees.
+        </p>
+      ) : null}
+    </div>
   );
 }
 

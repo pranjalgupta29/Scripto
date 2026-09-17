@@ -24,8 +24,15 @@ from scripto.jobs import queue
 from scripto.jobs.limits import provider_slot
 from scripto.jobs.registry import register
 from scripto.llm import get_llm
-from scripto.llm.prompts import EXTRACT_SCHEMA, EXTRACT_SYSTEM, extract_prompt
-from scripto.models import Chunk, Claim, Entity, EpisodeSource, Job
+from scripto.llm.prompts import (
+    EXTRACT_SCHEMA,
+    EXTRACT_SYSTEM,
+    IDENTITY_CHECK_SCHEMA,
+    IDENTITY_CHECK_SYSTEM,
+    extract_prompt,
+    identity_check_prompt,
+)
+from scripto.models import Chunk, Claim, Entity, EpisodeSource, Job, Source
 
 log = logging.getLogger(__name__)
 
@@ -121,13 +128,55 @@ def _parse_date(value) -> datetime | None:
     return None
 
 
-def extract_from_chunk(chunk: Chunk, subject_name: str) -> list[dict]:
+def _identity_of(entity: Entity) -> str | None:
+    """Who the subject is, beyond the name: the tells a same-name page fails."""
+    parts = [entity.headline or "", entity.employer or ""]
+    urls = (entity.external_ids or {}).get("evidence_urls") or []
+    if urls:
+        parts.append(str(urls[0]))
+    joined = " · ".join(p for p in parts if p)
+    return joined or None
+
+
+# How much of a page the identity gate reads. The opening carries the byline,
+# the role and the pronouns; the rest rarely changes the answer.
+IDENTITY_EXCERPT_CHARS = 1200
+
+
+def is_same_person(entity: Entity, source: Source, excerpt: str) -> tuple[bool, str]:
+    """One cheap call: is this page about the person the host confirmed?
+
+    Identity used to be checked once, at confirmation, and trusted forever. A
+    Times Now author page for a different Pranjal Gupta then contributed five
+    "facts" about the wrong person to a dossier.
+    """
+    with provider_slot("llm"):
+        payload = get_llm().complete_json(
+            role="rank",
+            system=IDENTITY_CHECK_SYSTEM,
+            prompt=identity_check_prompt(
+                subject=entity.name,
+                headline=entity.headline,
+                employer=entity.employer,
+                known_urls=(entity.external_ids or {}).get("evidence_urls") or [],
+                title=source.title,
+                url=source.url,
+                excerpt=excerpt[:IDENTITY_EXCERPT_CHARS],
+            ),
+            schema=IDENTITY_CHECK_SCHEMA,
+        )
+    return bool(payload.get("same_person", True)), (payload.get("why") or "").strip()
+
+
+def extract_from_chunk(
+    chunk: Chunk, subject_name: str, identity: str | None = None
+) -> list[dict]:
     llm = get_llm()
     with provider_slot("llm"):
         payload = llm.complete_json(
             role="extract",
             system=EXTRACT_SYSTEM,
-            prompt=extract_prompt(subject_name, chunk.text),
+            prompt=extract_prompt(subject_name, chunk.text, identity),
             schema=EXTRACT_SCHEMA,
         )
 
@@ -157,14 +206,16 @@ def run_extract(db: Session, job: Job) -> None:
     # A topic source is read against the one topic it was found for. Topic
     # sources used to be read against a label naming only the host's first three
     # topics, so a 20-section paper on habit extinction yielded nothing.
-    topic = db.scalar(
-        select(EpisodeSource.topic).where(
+    link = db.scalar(
+        select(EpisodeSource).where(
             EpisodeSource.episode_id == job.episode_id,
             EpisodeSource.source_id == source_id,
             EpisodeSource.subject_entity_id == subject_id,
         )
     )
+    topic = link.topic if link else None
     subject_name = topic or entity.name
+    identity = _identity_of(entity) if entity.type == "person" and not topic else None
     # A repair re-reads chunks already extracted (say, against the wrong
     # subject); ordinary retries skip them to stay cheap.
     reread = bool(job.payload.get("reread"))
@@ -175,6 +226,23 @@ def run_extract(db: Session, job: Job) -> None:
             select(Chunk).where(Chunk.source_id == source_id).order_by(Chunk.ordinal)
         )
     )
+
+    # Gate discovered pages on identity before mining them. What the host or the
+    # guest supplied is trusted: they know who they meant.
+    if (
+        chunks
+        and identity
+        and link is not None
+        and link.added_by == "system"
+        and link.identity is None
+    ):
+        source = db.get(Source, source_id)
+        same, why = is_same_person(entity, source, chunks[0].text)
+        link.identity = "ok" if same else "mismatch"
+        db.flush()
+        if not same:
+            log.info("skipped %s: not %s (%s)", source_id, entity.name, why)
+            return
 
     produced = 0
     for chunk in chunks:
@@ -189,7 +257,7 @@ def run_extract(db: Session, job: Job) -> None:
         if already and not reread:
             continue
 
-        for claim in extract_from_chunk(chunk, subject_name):
+        for claim in extract_from_chunk(chunk, subject_name, identity):
             stmt = (
                 pg_insert(Claim)
                 .values(

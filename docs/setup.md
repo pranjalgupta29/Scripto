@@ -156,3 +156,4 @@ a budget stops rather than spending.
 | Results look canned | fake providers, which is the default | §6 |
 | `429` from the LLM | free-tier rate limit | lower `PROVIDER_RPM_LLM` |
 | A stage stops with a budget error | the monthly ceiling was reached | raise it in `api/.env`, or wait for next month |
+| A LinkedIn profile URL is refused | LinkedIn blocks automated profile access (`999`) | upload the profile's "More → Save to PDF" export instead; LinkedIn articles and posts work as URLs |

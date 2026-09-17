@@ -124,6 +124,19 @@ class Episode(Base, TimestampMixin):
     coverage_mode: Mapped[str | None] = mapped_column(String(16))
     coverage_detail: Mapped[dict | None] = mapped_column(JSONB)
 
+    # A capability URL the host sends the guest: they upload a bio, CV or notes
+    # without an account. Unguessable, and revoked by clearing it. This is the
+    # remedy for a guest with little material online -- ask the guest.
+    prep_token: Mapped[str | None] = mapped_column(String(64), unique=True)
+    prep_token_created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    # The questionnaire the guest answers: drafted from the research, shaped by
+    # the kind of show, then edited and approved by the host. The link cannot be
+    # created until these are saved, so nothing reaches a guest unreviewed.
+    prep_style: Mapped[str | None] = mapped_column(String(32))
+    prep_questions: Mapped[list | None] = mapped_column(JSONB)
+    prep_published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
     guest: Mapped[Entity | None] = relationship(foreign_keys=[guest_entity_id], lazy="joined")
 
 
@@ -131,7 +144,7 @@ class Episode(Base, TimestampMixin):
 # sources
 # --------------------------------------------------------------------------
 
-SOURCE_TYPES = ("web_article", "youtube", "pdf", "profile", "user_pasted")
+SOURCE_TYPES = ("web_article", "youtube", "pdf", "docx", "profile", "user_pasted")
 SOURCE_STATUSES = ("pending", "fetched", "parsed", "failed")
 
 
@@ -143,7 +156,7 @@ class Source(Base):
         UniqueConstraint("canonical_url", name="uq_sources_canonical_url"),
         UniqueConstraint("checksum", name="uq_sources_checksum"),
         CheckConstraint(
-            "type IN ('web_article','youtube','pdf','profile','user_pasted')",
+            "type IN ('web_article','youtube','pdf','docx','profile','user_pasted')",
             name="ck_source_type",
         ),
         CheckConstraint(
@@ -181,7 +194,8 @@ class EpisodeSource(Base):
     source_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("sources.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    added_by: Mapped[str] = mapped_column(String(16), default="system", nullable=False)  # system|user
+    # system (discovered) | user (the host) | guest (sent through the prep link)
+    added_by: Mapped[str] = mapped_column(String(16), default="system", nullable=False)
     # Which research this source serves: the guest, or the topic brief. NULL is
     # treated as the guest (host-added sources, and rows from before this existed).
     subject_entity_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -190,6 +204,9 @@ class EpisodeSource(Base):
     # For topic research: the host topic this source was found for. Extraction
     # reads the source against it, and the topic brief gives each topic a share.
     topic: Mapped[str | None] = mapped_column(String(500))
+    # Identity gate verdict for a discovered page: ok | mismatch. NULL means not
+    # checked (host- and guest-supplied sources are trusted).
+    identity: Mapped[str | None] = mapped_column(String(16))
     removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False

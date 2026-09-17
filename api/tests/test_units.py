@@ -341,6 +341,23 @@ def test_long_form_means_an_appearance_not_just_a_long_page(
     assert is_long_form(source, chars) is expected
 
 
+@pytest.mark.parametrize(
+    "url,readable",
+    [
+        ("https://www.youtube.com/watch?v=vSswJ-rmPig", True),
+        ("https://youtu.be/vSswJ-rmPig", True),
+        ("https://www.youtube.com/@PranjalGupta_/videos", False),
+        ("https://music.youtube.com/channel/UCSUCWdctYJLPovtq2y519Rw", False),
+        ("https://example.com/an-article", True),
+    ],
+)
+def test_youtube_pages_with_nothing_to_read_are_skipped(url, readable):
+    """A real run spent 6 of its 8 source slots on channel pages, all of which failed."""
+    from scripto.pipeline.discover import is_readable
+
+    assert is_readable(url) is readable
+
+
 def test_interleave_takes_turns_and_stops_at_the_limit():
     """The topic brief takes one claim per topic in turn, so none fills the list."""
     from scripto.pipeline.dossier import _interleave

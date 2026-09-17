@@ -8,7 +8,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from scripto.config import settings
-from scripto.routes import auth, episodes, export
+from scripto.routes import auth, episodes, export, prep
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
@@ -25,6 +25,7 @@ app.add_middleware(
 app.include_router(auth.router)
 app.include_router(episodes.router)
 app.include_router(export.router)
+app.include_router(prep.router)
 
 
 @app.get("/health", tags=["meta"])

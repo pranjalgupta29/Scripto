@@ -4,6 +4,10 @@ import type {
   Candidate,
   Dossier,
   Episode,
+  PrepLink,
+  PrepPage,
+  PrepQuestion,
+  PrepQuestions,
   Script,
   SourceOut,
   SuggestTopicsResponse,
@@ -108,6 +112,93 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body),
     }),
+
+  uploadSource: async (id: string, file: File): Promise<SourceOut> => {
+    const token = getToken();
+    const form = new FormData();
+    form.append("file", file);
+    const response = await fetch(`${BASE}/episodes/${id}/sources/upload`, {
+      method: "POST",
+      // No Content-Type header: the browser sets the multipart boundary itself.
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      body: form,
+    });
+    if (!response.ok) {
+      const detail = await response.json().catch(() => null);
+      throw new ApiError(
+        response.status,
+        detail?.detail ?? `upload failed (${response.status})`,
+      );
+    }
+    return response.json();
+  },
+
+  // The prep questionnaire: drafted from the research, approved by the host.
+  getPrepQuestions: (id: string) =>
+    request<PrepQuestions>(`/episodes/${id}/prep-questions`),
+
+  suggestPrepQuestions: (id: string, style: string) =>
+    request<PrepQuestions>(
+      `/episodes/${id}/prep-questions/suggest?style=${encodeURIComponent(style)}`,
+      { method: "POST" },
+    ),
+
+  savePrepQuestions: (id: string, style: string, questions: PrepQuestion[]) =>
+    request<PrepQuestions>(`/episodes/${id}/prep-questions`, {
+      method: "PUT",
+      body: JSON.stringify({ style, questions }),
+    }),
+
+  submitPrepAnswers: (
+    token: string,
+    answers: { question: string; answer: string }[],
+  ) =>
+    request<SourceOut>(`/prep/${token}/answers`, {
+      method: "POST",
+      body: JSON.stringify({ answers }),
+    }),
+
+  // The guest prep link. The host creates it; the guest uses it with no account.
+  getPrepLink: (id: string) => request<PrepLink | null>(`/episodes/${id}/prep-link`),
+
+  createPrepLink: (id: string) =>
+    request<PrepLink>(`/episodes/${id}/prep-link`, { method: "POST" }),
+
+  revokePrepLink: (id: string) =>
+    request<void>(`/episodes/${id}/prep-link`, { method: "DELETE" }),
+
+  getPrepPage: (token: string) => request<PrepPage>(`/prep/${token}`),
+
+  submitPrepNotes: (
+    token: string,
+    body: {
+      bio?: string;
+      links?: string[];
+      want_to_discuss?: string;
+      avoid?: string;
+    },
+  ) =>
+    request<SourceOut>(`/prep/${token}/notes`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  uploadPrepFile: async (token: string, file: File): Promise<SourceOut> => {
+    const form = new FormData();
+    form.append("file", file);
+    const response = await fetch(`${BASE}/prep/${token}/upload`, {
+      method: "POST",
+      body: form, // no auth: the guest has no account
+    });
+    if (!response.ok) {
+      const detail = await response.json().catch(() => null);
+      throw new ApiError(
+        response.status,
+        detail?.detail ?? `upload failed (${response.status})`,
+      );
+    }
+    return response.json();
+  },
 
   removeSource: (id: string, sourceId: string) =>
     request<void>(`/episodes/${id}/sources/${sourceId}`, { method: "DELETE" }),

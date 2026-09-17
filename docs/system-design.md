@@ -450,6 +450,11 @@ topics) the topic entity named in the job payload.
   read against a label naming only the host's first three topics, so pages about
   later topics yielded almost nothing: a Nature paper on habit extinction gave 20
   sections and 0 claims.
+- **Pages that can never be read are skipped** (`is_readable()`): a YouTube URL
+  with no video id is a channel, playlist or search page and carries no
+  transcript. `"{name}" site:youtube.com` returns those by the handful, and one
+  real run spent 6 of its 8 slots on them, leaving the episode a single usable
+  source.
 - Every search is charged to the search budget and paced on its own. Until
   2026-09-15 the whole run counted as one charge, so the budget undercounted by
   about 7×.
@@ -489,12 +494,62 @@ topics) the topic entity named in the job payload.
   - `youtube`: walks an ordered list of `TranscriptStrategy` objects. Captions is
     on; Whisper is present but disabled (§18). The raw payload stored is the
     transcript JSON, with millisecond segments.
-  - `pdf`: `pypdf`. Not yet tested against real PDFs.
+  - `pdf`: `pypdf`. Also the type an uploaded PDF takes.
+  - `docx`: `python-docx`, for an uploaded Word resume or bio. Reads table cells
+    as well as paragraphs, because resumes keep dates and employers in tables.
   - `user_pasted`: the blob is created at `POST` time and never fetched. This is
-    also how thin-footprint guests get a bio, CV or notes into the system.
+    also how thin-footprint guests get a bio, CV or notes into the system, and
+    the type used for uploaded `.txt` and `.md` files.
   - `profile`: the same as `web_article`.
 - `classify_url()` maps YouTube hosts to `youtube`, `.pdf` URLs to `pdf`,
   LinkedIn/X/Twitter to `profile`, and everything else to `web_article`.
+
+**Uploads** (`POST /episodes/{id}/sources/upload`, multipart). The host supplies
+material directly: `.pdf`, `.docx`, `.txt` or `.md`, up to `MAX_UPLOAD_BYTES`
+(10 MB). The bytes go straight to the blob store, the source starts at `fetched`,
+and parsing proceeds as for anything else, so uploaded material is cited exactly
+like a discovered page. Files we cannot read are refused at the door (415) rather
+than stored as a source that can never parse. Uploads count against the host's own
+source allowance, never the discovery one.
+
+**LinkedIn profiles cannot be fetched and never will be.** `linkedin.com/in/…`
+answers `999` to anonymous requests; it is a deliberate block, and scraping
+profiles is against LinkedIn's terms. Adding a profile URL is therefore refused
+with guidance to upload the profile's own "Save to PDF" export, which is the
+supported path. LinkedIn *articles* (`/pulse/`) and *posts* are ordinary pages and
+still work as URLs. No LinkedIn API reaches a third party's profile either: sign-in
+returns only the signed-in member's own name, photo and email, so it is an identity
+mechanism, not a research one.
+
+### 5.3a The guest prep link — `pipeline/prep.py`, `routes/prep.py`
+
+Search cannot reach the one source that knows most: the guest. This is the
+remedy, and the answer to a guest with little material online.
+
+1. **Draft** (`POST /episodes/{id}/prep-questions/suggest?style=…`, inline, one
+   compose call). Questions are grounded in the dossier the research already
+   produced, each citing the claim ids it rests on, and shaped by the kind of
+   show — `conversational`, `formal`, `contrarian`, `educational`, the same
+   vocabulary the script uses. Ungrounded questions that merely suit the format
+   are allowed and labelled `format`. Nothing is stored.
+2. **Approve** (`PUT /episodes/{id}/prep-questions`). The host edits, adds,
+   removes, and saves. Only then are the questions the host's own.
+3. **Publish** (`POST /episodes/{id}/prep-link`). Refused with `409` until a
+   questionnaire is saved, so nothing reaches a guest that the host has not read.
+   The token is `secrets.token_urlsafe(32)`: a capability URL, unique per
+   episode, revocable by clearing it. Revoking keeps whatever already arrived.
+4. **The guest answers** with no account. `GET /prep/{token}` returns the episode
+   title, the guest's name and the question text — never the host's reasoning,
+   the claim ids, the dossier or the script. They answer questions
+   (`/answers`), attach a CV or bio (`/upload`), and add links or anything else
+   (`/notes`).
+
+Everything the guest sends becomes an ordinary source, `added_by = "guest"`, with
+its own allowance separate from the host's, so guest material can never be
+crowded out by discovery. It is parsed, chunked and extracted like any page,
+which means a line the host later writes from the guest's own words carries a
+citation back to them. Answers are stored as question-and-answer pairs so the
+context survives.
 
 ### 5.4 Parse and chunk — `pipeline/fetch.py`, `pipeline/chunking.py`
 
@@ -545,9 +600,26 @@ topics) the topic entity named in the job payload.
 - If anything was produced, `cluster_claims` is enqueued with a 10 s delay,
   unless one is already waiting for this subject. That run will see every claim
   that exists when it starts, so a 10-source episode clusters once, not 10 times.
-- **Gap.** "Only claims about the subject" is enforced only by the prompt. A
-  claim about Steve Ballmer inside a Nadella article could get through. Eval
-  traps are meant to catch this.
+- **Identity gate.** Before a *discovered* page is mined for a person, one cheap
+  call (role `rank`) asks whether the page is about the person the host
+  confirmed, given their role, employer and known links, plus the page's opening.
+  The verdict is stored on `episode_sources.identity` (`ok` / `mismatch`); a
+  mismatch takes no claims at all and the UI labels that source **not this
+  person**. Sources the host or the guest supplied are trusted and skip the gate —
+  they know who they meant. The extractor is also told *which* person the subject
+  is, so a same-name passage inside a page that passed the gate still yields
+  nothing.
+- **Why it exists.** Identity was verified once, at confirmation, and then
+  trusted forever. For a common name that is fatal: a Times Now author page for a
+  *different* Pranjal Gupta — a journalist — contributed five "facts" to a
+  JPMorgan engineer's dossier, among them that he "appreciates theatre", taken
+  from "she values all kinds of art forms, from theatre and cinema to anime". The
+  prep drafter then asked him about the theatre background he does not have. Both
+  failures were real: the wrong person's page, and a question asserting more than
+  its claim said (§5.3a).
+- **Gap.** Within a page that passes the gate, "only claims about the subject" is
+  still enforced by the prompt alone. A claim about Steve Ballmer inside a Nadella
+  article could get through. Eval traps are meant to catch this.
 
 ### 5.7 Cluster claims — `pipeline/cluster.py`
 
@@ -1051,7 +1123,13 @@ probed).
 | GET | `/episodes/{id}` | Episode, guest, sources, job progress, candidates. **The polling endpoint** | sync |
 | POST | `/episodes/{id}/identify` | Search and rank candidates | sync (inline) |
 | POST | `/episodes/{id}/confirm-guest` | Freeze the chosen identity, start ingestion | enqueues |
-| POST | `/episodes/{id}/sources` | Add a URL (fetched) or pasted text (parsed directly) | enqueues |
+| POST | `/episodes/{id}/sources` | Add a URL (fetched) or pasted text (parsed directly). LinkedIn profile URLs are refused with guidance to upload instead | enqueues |
+| POST | `/episodes/{id}/sources/upload` | Upload a resume, bio or notes: `.pdf`, `.docx`, `.txt`, `.md`, up to `MAX_UPLOAD_BYTES`. 415 for anything else | enqueues |
+| POST | `/episodes/{id}/prep-questions/suggest` | Draft guest questions from the research, shaped by the show format. Stores nothing | 1 LLM, inline |
+| GET/PUT | `/episodes/{id}/prep-questions` | The host's approved questionnaire | sync |
+| GET/POST/DELETE | `/episodes/{id}/prep-link` | The guest's capability URL. `POST` is refused (409) until questions are saved; `DELETE` revokes | sync |
+| GET | `/prep/{token}` | **Public.** Episode title, guest name, question text. No research, no reasoning | sync |
+| POST | `/prep/{token}/answers` · `/upload` · `/notes` | **Public.** The guest's answers, files and links become sources (`added_by = "guest"`) | enqueues |
 | DELETE | `/episodes/{id}/sources/{sid}` | Soft-remove from this episode only | sync |
 | GET | `/episodes/{id}/dossier` | Sections, items and citations with quoted text | sync |
 | POST | `/episodes/{id}/topics` | Set 3–6 topics; once coverage has run, starts research on any new topic | sync |
@@ -1127,6 +1205,7 @@ the same code can be deployed unchanged.
 | | `EMBEDDING_API_KEY`, `EMBEDDING_MODEL`, `EMBEDDING_DIM` | —, `voyage-3`, 1024 | The dimension is fixed by the schema |
 | Search | `SEARCH_PROVIDER`, `SEARCH_API_KEY` | `fake` | `duckduckgo` (no key), `exa`, `tavily` |
 | Pipeline | `MAX_SOURCES_PER_EPISODE` | 25 | |
+| | `MAX_UPLOAD_BYTES` | 10 MB | Ceiling for a host-uploaded resume, bio or transcript |
 | | `MAX_EPISODES_PER_USER_PER_DAY` | 10 | |
 | | `CHUNK_TARGET_TOKENS`, `CHUNK_OVERLAP_TOKENS` | 750, 100 | |
 | | `CLUSTER_SIMILARITY_THRESHOLD` | 0.86 | |
@@ -1148,7 +1227,7 @@ the same code can be deployed unchanged.
 
 ## 14. Testing, provider checks and evals
 
-### Tests — `api/tests/`, 90 of them
+### Tests — `api/tests/`, 105 of them
 
 | File | What it covers |
 |---|---|
@@ -1232,6 +1311,8 @@ concurrency were involved.
 | Dossier stuck empty but marked ready | The first build ran with 0 claims; its idempotency key blocked every rebuild | Key includes the claim count; empty output from real claims now raises | It needed extraction to fail first |
 | Cluster rebuild failed | A foreign key from `dossier_items` blocked deleting clusters | ON DELETE SET NULL | It needed a dossier built before re-clustering |
 | 30% of citations pointed at unrelated text | Models report character offsets badly | Ask for the quote and find it in code | The fake computes its spans correctly |
+| A guest was asked about his theatre background, which he does not have | Identity was checked once at confirmation and then trusted. A Times Now author page for a *different* person of the same name was mined for claims about him | Identity gate per discovered source (§5.5), and the extractor is now told *which* person the subject is | The fake search returns one canonical person; only the open web has namesakes |
+| 6 of 8 source slots spent on pages that cannot be read | `"{name}" site:youtube.com` returns channel pages, which carry no transcript | `is_readable()` skips YouTube URLs with no video id | The fake search returns watchable video URLs |
 | A claim id showed up as a script risk flag | Gemini put a claim UUID into `risk_flags` | Bare UUIDs are dropped from every text list in a block | The fake never does it |
 | The progress bar's numbers kept climbing | The bar counted jobs, and a waiting coverage check added a new job every 10 s | The check reschedules itself; the bar counts sources and shows the stage | The fakes finish instantly, so nothing waits |
 | Topic research added more Huberman interviews | Topic discovery ignored its payload and searched for the guest | Discovery researches the entity it is handed; the subject travels with each source to extraction | No test checked what topic research searched for |
@@ -1336,7 +1417,7 @@ api/
     main.py              FastAPI app, CORS, /health, /usage
     check_provider.py    LLM provider smoke test
     adapters/            base (ParsedSource, canonicalize_url), web_article,
-                         youtube (TranscriptStrategy), simple (pdf, user_pasted)
+                         youtube (TranscriptStrategy), simple (pdf, docx, user_pasted)
     search/              duckduckgo, exa, tavily, fake
     embeddings/          gemini, voyage, fake
     llm/                 base (interface, JSON parsing, coerce_to_schema),

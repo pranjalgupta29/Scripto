@@ -777,9 +777,9 @@ def test_topic_sources_are_read_against_their_own_topic(auth_client, db, monkeyp
     subjects: list[str] = []
     original = extract.extract_from_chunk
 
-    def recording(chunk, subject_name):
+    def recording(chunk, subject_name, identity=None):
         subjects.append(subject_name)
-        return original(chunk, subject_name)
+        return original(chunk, subject_name, identity)
 
     monkeypatch.setattr(extract, "extract_from_chunk", recording)
 
@@ -841,8 +841,8 @@ def test_a_topic_with_nothing_sourced_is_reported(auth_client, monkeypatch):
     monkeypatch.setattr(
         extract,
         "extract_from_chunk",
-        lambda chunk, subject_name: (
-            [] if subject_name == "Regulation" else original(chunk, subject_name)
+        lambda chunk, subject_name, identity=None: (
+            [] if subject_name == "Regulation" else original(chunk, subject_name, identity)
         ),
     )
 
@@ -852,3 +852,353 @@ def test_a_topic_with_nothing_sourced_is_reported(auth_client, monkeypatch):
 
     dossier = auth_client.get(f"/episodes/{episode_id}/dossier").json()
     assert dossier["coverage_detail"]["topic_gaps"] == ["Regulation"]
+
+
+# --------------------------------------------------------------------------
+# uploads: the remedy for a guest with little material online
+# --------------------------------------------------------------------------
+
+RESUME = """Dana Reyes
+Partner, Northwind Capital
+Led the private credit desk from 2019 to 2024.
+Built the firm's liquidity risk framework after the 2022 drawdown.
+Speaks regularly on regulation of private markets.
+"""
+
+
+def _pdf_bytes(text: str) -> bytes:
+    import io
+
+    from reportlab.lib.pagesizes import LETTER
+    from reportlab.pdfgen import canvas
+
+    buffer = io.BytesIO()
+    pdf = canvas.Canvas(buffer, pagesize=LETTER)
+    height = 720
+    for line in text.splitlines():
+        pdf.drawString(72, height, line)
+        height -= 16
+    pdf.save()
+    return buffer.getvalue()
+
+
+def _docx_bytes(text: str) -> bytes:
+    import io
+
+    import docx
+
+    document = docx.Document()
+    for line in text.splitlines():
+        document.add_paragraph(line)
+    buffer = io.BytesIO()
+    document.save(buffer)
+    return buffer.getvalue()
+
+
+def test_an_uploaded_pdf_resume_becomes_a_readable_source(auth_client, db):
+    """A guest with nothing online: the host supplies the material directly."""
+    episode_id = _episode_with_guest(auth_client)
+    response = auth_client.post(
+        f"/episodes/{episode_id}/sources/upload",
+        files={"file": ("dana-reyes-cv.pdf", _pdf_bytes(RESUME), "application/pdf")},
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["type"] == "pdf"
+    drain()
+
+    listed = auth_client.get(f"/episodes/{episode_id}").json()["sources"]
+    uploaded = next(s for s in listed if s["title"] == "dana-reyes-cv.pdf")
+    assert uploaded["status"] == "parsed", uploaded["error"]
+    assert uploaded["added_by"] == "user"
+
+    text = " ".join(
+        db.scalars(
+            select(Chunk.text)
+            .join(Source, Source.id == Chunk.source_id)
+            .where(Source.id == uuid.UUID(uploaded["id"]))
+        )
+    )
+    assert "Northwind Capital" in text
+
+
+def test_an_uploaded_word_resume_is_read(auth_client, db):
+    episode_id = _episode_with_guest(auth_client)
+    response = auth_client.post(
+        f"/episodes/{episode_id}/sources/upload",
+        files={
+            "file": (
+                "cv.docx",
+                _docx_bytes(RESUME),
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
+        },
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["type"] == "docx"
+    drain()
+
+    source_id = uuid.UUID(response.json()["id"])
+    text = " ".join(
+        db.scalars(select(Chunk.text).where(Chunk.source_id == source_id))
+    )
+    assert "liquidity risk framework" in text
+
+
+def test_uploads_we_cannot_read_are_refused(auth_client, monkeypatch):
+    """Refused at the door, rather than stored as a source that never parses."""
+    episode_id = _episode_with_guest(auth_client)
+
+    refused = auth_client.post(
+        f"/episodes/{episode_id}/sources/upload",
+        files={"file": ("notes.pages", b"whatever", "application/octet-stream")},
+    )
+    assert refused.status_code == 415
+    assert ".docx" in refused.json()["detail"]
+
+    empty = auth_client.post(
+        f"/episodes/{episode_id}/sources/upload",
+        files={"file": ("empty.txt", b"   ", "text/plain")},
+    )
+    assert empty.status_code == 400
+
+    from scripto.config import settings
+
+    monkeypatch.setattr(settings, "max_upload_bytes", 10)
+    too_big = auth_client.post(
+        f"/episodes/{episode_id}/sources/upload",
+        files={"file": ("cv.txt", RESUME.encode(), "text/plain")},
+    )
+    assert too_big.status_code == 413
+
+
+def test_linkedin_profiles_explain_the_upload_path(auth_client, monkeypatch):
+    """LinkedIn answers 999 to profile fetches; a doomed fetch teaches nothing."""
+    _stub_article_fetch(monkeypatch)
+    episode_id = _episode_with_guest(auth_client)
+
+    refused = auth_client.post(
+        f"/episodes/{episode_id}/sources",
+        json={"url": "https://www.linkedin.com/in/dana-reyes/"},
+    )
+    assert refused.status_code == 400
+    assert "Save to PDF" in refused.json()["detail"]
+
+    # Articles and posts are ordinary pages and still work.
+    allowed = auth_client.post(
+        f"/episodes/{episode_id}/sources",
+        json={"url": "https://www.linkedin.com/pulse/private-credit-dana-reyes/"},
+    )
+    assert allowed.status_code == 201
+
+
+# --------------------------------------------------------------------------
+# the guest prep link: ask the guest, the one source search cannot reach
+# --------------------------------------------------------------------------
+
+
+def test_a_same_name_page_yields_no_claims(auth_client, db, monkeypatch):
+    """A Times Now author page for a different Pranjal Gupta contributed five
+    "facts" to his dossier, and a question about a theatre career he never had."""
+    from scripto.adapters.web_article import WebArticleAdapter
+    from scripto.models import EpisodeSource
+
+    decoy = (
+        "<html><head><title>Dana Reyes - News</title></head><body><article>"
+        "<h1>Dana Reyes</h1>"
+        "<p>Dana Reyes is a culture reporter at Times Now who found her passion in "
+        "journalism. Besides that, she values all kinds of art forms, from theatre "
+        "and cinema to anime. She has written about film for six years and joined "
+        "the arts desk after a decade covering local news for regional papers.</p>"
+        "</article></body></html>"
+    ).encode()
+    monkeypatch.setattr(WebArticleAdapter, "fetch", lambda self, url: decoy)
+
+    episode_id = _episode_with_guest(auth_client)
+    drain()
+
+    listed = auth_client.get(f"/episodes/{episode_id}").json()["sources"]
+    discovered = [s for s in listed if s["added_by"] == "system" and s["status"] == "parsed"]
+    assert discovered, "discovery found nothing to judge"
+    assert all(s["identity"] == "mismatch" for s in discovered), discovered
+
+    episode = db.get(Episode, uuid.UUID(episode_id))
+    claims = list(
+        db.scalars(select(Claim.id).where(Claim.subject_entity_id == episode.guest_entity_id))
+    )
+    assert not claims, "claims were taken from a page about someone else"
+
+    checked = list(
+        db.scalars(
+            select(EpisodeSource.identity).where(
+                EpisodeSource.episode_id == episode.id,
+                EpisodeSource.added_by == "system",
+            )
+        )
+    )
+    assert "ok" not in checked
+
+
+def _guest_client():
+    """A visitor with no account: the prep link is the only thing they hold."""
+    from fastapi.testclient import TestClient
+
+    from scripto.main import app
+
+    return TestClient(app)
+
+
+def _published_prep_link(auth_client, episode_id: str) -> str:
+    """Approve a questionnaire, then publish the link. The host reviews first."""
+    saved = auth_client.put(
+        f"/episodes/{episode_id}/prep-questions",
+        json={
+            "style": "conversational",
+            "questions": [{"text": "What are you working on right now?"}],
+        },
+    )
+    assert saved.status_code == 200, saved.text
+    created = auth_client.post(f"/episodes/{episode_id}/prep-link")
+    assert created.status_code == 201, created.text
+    return created.json()["token"]
+
+
+def test_the_prep_link_brings_the_guests_own_material_in(auth_client, db):
+    episode_id = _episode_with_guest(auth_client)
+    token = _published_prep_link(auth_client, episode_id)
+    assert auth_client.get(f"/episodes/{episode_id}/prep-link").json()["path"] == f"/prep/{token}"
+    # Asking twice is not a mistake; it returns the same link.
+    assert auth_client.post(f"/episodes/{episode_id}/prep-link").json()["token"] == token
+
+    guest = _guest_client()
+    page = guest.get(f"/prep/{token}")
+    assert page.status_code == 200, page.text
+    assert page.json()["guest_name"] == "Dana Reyes"
+
+    uploaded = guest.post(
+        f"/prep/{token}/upload",
+        files={"file": ("cv.pdf", _pdf_bytes(RESUME), "application/pdf")},
+    )
+    assert uploaded.status_code == 201, uploaded.text
+    assert uploaded.json()["added_by"] == "guest"
+
+    notes = guest.post(
+        f"/prep/{token}/notes",
+        json={
+            "bio": "I run the private credit desk at Northwind.",
+            "want_to_discuss": "Why retail money is the wrong money for illiquid assets.",
+            "avoid": "The 2019 merger, which I have answered many times.",
+        },
+    )
+    assert notes.status_code == 201, notes.text
+    drain()
+
+    listed = auth_client.get(f"/episodes/{episode_id}").json()["sources"]
+    from_guest = [s for s in listed if s["added_by"] == "guest"]
+    assert len(from_guest) == 2
+    assert all(s["status"] == "parsed" for s in from_guest), from_guest
+
+    text = " ".join(
+        db.scalars(
+            select(Chunk.text)
+            .join(Source, Source.id == Chunk.source_id)
+            .where(Source.id.in_([uuid.UUID(s["id"]) for s in from_guest]))
+        )
+    )
+    assert "wrong money for illiquid assets" in text, "the guest's own words are missing"
+    assert "Northwind Capital" in text, "the uploaded CV was not read"
+
+    assert guest.get(f"/prep/{token}").json()["submitted"] == 2
+    assert guest.get("/prep/not-a-real-token").status_code == 404
+
+
+def test_revoking_the_prep_link_stops_it_but_keeps_what_arrived(auth_client):
+    episode_id = _episode_with_guest(auth_client)
+    token = _published_prep_link(auth_client, episode_id)
+
+    guest = _guest_client()
+    assert guest.post(f"/prep/{token}/notes", json={"bio": "A short bio."}).status_code == 201
+
+    assert auth_client.delete(f"/episodes/{episode_id}/prep-link").status_code == 204
+    assert guest.get(f"/prep/{token}").status_code == 404
+    assert guest.post(f"/prep/{token}/notes", json={"bio": "More."}).status_code == 404
+    assert auth_client.get(f"/episodes/{episode_id}/prep-link").json() is None
+
+    sources = auth_client.get(f"/episodes/{episode_id}").json()["sources"]
+    assert any(s["added_by"] == "guest" for s in sources), "what the guest sent must survive"
+
+
+def test_prep_notes_need_content_and_refuse_linkedin_profiles(auth_client):
+    episode_id = _episode_with_guest(auth_client)
+    token = _published_prep_link(auth_client, episode_id)
+    guest = _guest_client()
+
+    assert guest.post(f"/prep/{token}/notes", json={}).status_code == 400
+
+    profile = guest.post(
+        f"/prep/{token}/notes",
+        json={"bio": "A bio.", "links": ["https://www.linkedin.com/in/dana-reyes/"]},
+    )
+    assert profile.status_code == 400
+    assert "Save to PDF" in profile.json()["detail"]
+
+
+def test_prep_questions_are_drafted_from_research_then_approved(auth_client):
+    """The host edits a draft grounded in the research, and approves it."""
+    episode_id = _ready_episode(auth_client)
+
+    drafted = auth_client.post(
+        f"/episodes/{episode_id}/prep-questions/suggest?style=conversational"
+    )
+    assert drafted.status_code == 200, drafted.text
+    questions = drafted.json()["questions"]
+    assert questions, "nothing was drafted"
+    assert any(
+        q["basis"] == "research" and q["citations"] for q in questions
+    ), "no question was grounded in the research"
+
+    # A draft is not a questionnaire: nothing is stored, and no link can exist.
+    assert auth_client.get(f"/episodes/{episode_id}/prep-questions").json()["questions"] == []
+    assert auth_client.post(f"/episodes/{episode_id}/prep-link").status_code == 409
+
+    edited = [{"text": "What would you want asked that nobody asks?"}, questions[0]]
+    saved = auth_client.put(
+        f"/episodes/{episode_id}/prep-questions",
+        json={"style": "contrarian", "questions": edited},
+    )
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["style"] == "contrarian"
+    approved = saved.json()["questions"]
+    assert approved[0]["text"] == "What would you want asked that nobody asks?"
+
+    token = auth_client.post(f"/episodes/{episode_id}/prep-link").json()["token"]
+    page = _guest_client().get(f"/prep/{token}").json()
+    assert [q["text"] for q in page["questions"]] == [q["text"] for q in approved]
+    # The host's reasoning and the claims behind a question stay private.
+    assert all(q["why"] is None and q["claim_ids"] == [] for q in page["questions"])
+
+
+def test_guest_answers_become_a_source_the_host_can_cite(auth_client, db):
+    episode_id = _episode_with_guest(auth_client)
+    token = _published_prep_link(auth_client, episode_id)
+    guest = _guest_client()
+    asked = guest.get(f"/prep/{token}").json()["questions"][0]["text"]
+
+    answered = guest.post(
+        f"/prep/{token}/answers",
+        json={
+            "answers": [
+                {"question": asked, "answer": "A new fund for climate infrastructure."}
+            ]
+        },
+    )
+    assert answered.status_code == 201, answered.text
+    assert answered.json()["added_by"] == "guest"
+    drain()
+
+    text = " ".join(
+        db.scalars(select(Chunk.text).where(Chunk.source_id == uuid.UUID(answered.json()["id"])))
+    )
+    assert "climate infrastructure" in text
+    assert asked in text, "the question is stored with the answer, for context"
+
+    assert guest.post(f"/prep/{token}/answers", json={"answers": []}).status_code == 400

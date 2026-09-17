@@ -28,6 +28,36 @@ export interface SourceOut {
   added_by: string;
   subject: "guest" | "topic";
   topic: string | null;
+  // Identity gate verdict for a discovered page: "ok", "mismatch", or null.
+  identity: string | null;
+}
+
+export interface PrepLink {
+  token: string;
+  path: string;
+  created_at: string | null;
+}
+
+export interface PrepQuestion {
+  text: string;
+  why: string | null;
+  basis: string;
+  claim_ids: string[];
+  citations?: Citation[];
+}
+
+export interface PrepQuestions {
+  episode_id: string;
+  style: string;
+  questions: PrepQuestion[];
+}
+
+export interface PrepPage {
+  episode_title: string;
+  guest_name: string;
+  style: string;
+  questions: { text: string }[];
+  submitted: number;
 }
 
 export interface JobProgress {

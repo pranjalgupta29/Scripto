@@ -63,8 +63,73 @@ class SourceOut(BaseModel):
     subject: str = "guest"
     # For topic research: the host topic this source was found for.
     topic: str | None = None
+    # Identity gate verdict for a discovered page: "ok", "mismatch", or None.
+    identity: str | None = None
 
     model_config = {"from_attributes": True}
+
+
+class PrepLinkOut(BaseModel):
+    """The link the host sends the guest."""
+
+    token: str
+    path: str
+    created_at: datetime | None = None
+
+
+PREP_STYLES = Literal["conversational", "formal", "contrarian", "educational"]
+
+
+class PrepQuestion(BaseModel):
+    """One question on the guest's questionnaire, as approved by the host."""
+
+    text: str
+    why: str | None = None
+    basis: str = "host"  # research | format | host
+    claim_ids: list[str] = []
+
+
+class PrepQuestionSuggestion(PrepQuestion):
+    citations: list[CitationOut] = []
+
+
+class PrepQuestionsResponse(BaseModel):
+    episode_id: uuid.UUID
+    style: str
+    questions: list[PrepQuestionSuggestion]
+
+
+class PrepQuestionsRequest(BaseModel):
+    """What the host approves. Questions are theirs by the time they are saved."""
+
+    style: PREP_STYLES = "conversational"
+    questions: list[PrepQuestion] = Field(min_length=1, max_length=12)
+
+
+class PrepPageOut(BaseModel):
+    """What the guest sees: enough to know the link is genuine, no more."""
+
+    episode_title: str
+    guest_name: str
+    style: str = "conversational"
+    questions: list[PrepQuestion] = []
+    submitted: int = 0
+
+
+class PrepAnswer(BaseModel):
+    question: str
+    answer: str
+
+
+class PrepAnswersRequest(BaseModel):
+    answers: list[PrepAnswer] = Field(default_factory=list, max_length=12)
+
+
+class PrepNotesRequest(BaseModel):
+    bio: str | None = None
+    links: list[str] = Field(default_factory=list, max_length=10)
+    want_to_discuss: str | None = None
+    avoid: str | None = None
 
 
 class AddSourceRequest(BaseModel):

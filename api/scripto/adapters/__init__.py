@@ -11,7 +11,7 @@ from scripto.adapters.base import (
     SourceAdapter,
     canonicalize_url,
 )
-from scripto.adapters.simple import PdfAdapter, UserPastedAdapter
+from scripto.adapters.simple import DocxAdapter, PdfAdapter, UserPastedAdapter
 from scripto.adapters.web_article import WebArticleAdapter
 from scripto.adapters.youtube import YouTubeAdapter
 
@@ -19,6 +19,7 @@ _ADAPTERS: dict[str, SourceAdapter] = {
     "web_article": WebArticleAdapter(),
     "youtube": YouTubeAdapter(),
     "pdf": PdfAdapter(),
+    "docx": DocxAdapter(),
     "user_pasted": UserPastedAdapter(),
     # A profile page is just an article we treat as authoritative about the guest.
     "profile": WebArticleAdapter(),

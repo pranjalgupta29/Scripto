@@ -111,6 +111,10 @@ class Settings(BaseSettings):
     provider_rpm_embedding: int = 0
     provider_rpm_fetch: int = 0
 
+    # --- uploads ---
+    # The host's own material: a resume, a bio, a LinkedIn "Save to PDF" export.
+    max_upload_bytes: int = 10 * 1024 * 1024
+
     # --- misc ---
     http_user_agent: str = "ScriptoBot/0.1 (+research)"
     http_timeout_seconds: float = 30.0

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import uuid
 from datetime import date, datetime, timezone
+from pathlib import PurePosixPath
+from urllib.parse import urlsplit
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile, status
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -93,7 +95,13 @@ def _check_quota(db: Session, user: User) -> None:
 def _sources_for(db: Session, episode_id: uuid.UUID) -> list[SourceOut]:
     topic_id = db.scalar(select(Episode.topic_entity_id).where(Episode.id == episode_id))
     rows = db.execute(
-        select(Source, EpisodeSource.added_by, EpisodeSource.subject_entity_id, EpisodeSource.topic)
+        select(
+            Source,
+            EpisodeSource.added_by,
+            EpisodeSource.subject_entity_id,
+            EpisodeSource.topic,
+            EpisodeSource.identity,
+        )
         .join(EpisodeSource, EpisodeSource.source_id == Source.id)
         .where(EpisodeSource.episode_id == episode_id, EpisodeSource.removed_at.is_(None))
         .order_by(Source.created_at)
@@ -111,8 +119,9 @@ def _sources_for(db: Session, episode_id: uuid.UUID) -> list[SourceOut]:
             added_by=added_by,
             subject="topic" if topic_id and subject_id == topic_id else "guest",
             topic=topic,
+            identity=identity,
         )
-        for s, added_by, subject_id, topic in rows
+        for s, added_by, subject_id, topic, identity in rows
     ]
 
 
@@ -264,22 +273,27 @@ def _episode_out(db: Session, episode: Episode, *, include_sources: bool = True)
 # sources
 # --------------------------------------------------------------------------
 
+# What an upload may be. Anything else is refused with this list, rather than
+# stored as a source that can never be read.
+UPLOAD_TYPES = {".pdf": "pdf", ".docx": "docx", ".txt": "user_pasted", ".md": "user_pasted"}
 
-@router.post("/episodes/{episode_id}/sources", response_model=SourceOut, status_code=201)
-def add_source(
-    episode_id: uuid.UUID,
-    body: AddSourceRequest,
-    db: Session = Depends(get_db),
-    user: User = Depends(current_user),
-) -> SourceOut:
-    from scripto.adapters import canonicalize_url, classify_url
-    from scripto.pipeline.discover import attach_source
+LINKEDIN_PROFILE_HINT = (
+    "LinkedIn blocks automated access to profile pages, so this one cannot be read. "
+    "Open the profile, choose More and then Save to PDF, and upload that file here -- "
+    "or paste the text. LinkedIn articles and posts can be added as URLs."
+)
 
-    episode = _owned_episode(episode_id, db, user)
 
-    # Only sources the host added count here. Discovered sources have their own
-    # allowance and must never stop the host pasting a bio or notes -- the main
-    # remedy for a thin guest.
+def _is_linkedin_profile(url: str) -> bool:
+    parts = urlsplit(url.strip())
+    host = parts.netloc.lower().removeprefix("www.")
+    return host.endswith("linkedin.com") and parts.path.lower().startswith(("/in/", "/pub/"))
+
+
+def _check_source_allowance(db: Session, episode: Episode) -> None:
+    """Only sources the host added count. Discovered sources have their own
+    allowance and must never stop the host adding a bio, resume or note -- the
+    main remedy for a guest with little material online."""
     current = db.scalar(
         select(func.count(EpisodeSource.id)).where(
             EpisodeSource.episode_id == episode.id,
@@ -294,44 +308,98 @@ def add_source(
             "to this episode",
         )
 
-    if body.text:
-        # Pasted text is stored as a blob immediately and needs no fetch.
-        raw = body.text.encode()
-        digest = checksum(raw)
-        existing = db.scalar(select(Source).where(Source.checksum == digest))
-        if existing is None:
-            existing = Source(
-                id=uuid.uuid4(),
-                type="user_pasted",
-                url=None,
-                canonical_url=f"pasted:{digest}",
-                title=body.title,
-                blob_ref=get_blob().put(digest, raw),
-                checksum=digest,
-                fetched_at=datetime.now(timezone.utc),
-                status="fetched",
-            )
-            db.add(existing)
-            db.flush()
+
+def _attach_in_hand_source(
+    db: Session,
+    *,
+    episode: Episode,
+    user_id: uuid.UUID,
+    raw: bytes,
+    source_type: str,
+    title: str | None,
+    added_by: str = "user",
+) -> Source:
+    """Attach content someone already holds: pasted text, or an uploaded file.
+
+    There is nothing to fetch, so the bytes go straight to the blob store and the
+    source starts at "fetched". Identical content is stored once and reused.
+    `added_by` is "user" for the host and "guest" for the prep link.
+    """
+    digest = checksum(raw)
+    source = db.scalar(select(Source).where(Source.checksum == digest))
+    if source is None:
+        prefix = "pasted" if source_type == "user_pasted" else "upload"
+        source = Source(
+            id=uuid.uuid4(),
+            type=source_type,
+            url=None,
+            canonical_url=f"{prefix}:{digest}",
+            title=title,
+            blob_ref=get_blob().put(digest, raw),
+            checksum=digest,
+            fetched_at=datetime.now(timezone.utc),
+            status="fetched",
+        )
+        db.add(source)
+        db.flush()
+
+    link = db.scalar(
+        select(EpisodeSource).where(
+            EpisodeSource.episode_id == episode.id,
+            EpisodeSource.source_id == source.id,
+        )
+    )
+    if link is None:
         db.add(
             EpisodeSource(
                 episode_id=episode.id,
-                source_id=existing.id,
-                added_by="user",
+                source_id=source.id,
+                added_by=added_by,
                 subject_entity_id=episode.guest_entity_id,
             )
         )
-        db.flush()
-        queue.enqueue(
+    elif link.removed_at is not None:
+        link.removed_at = None  # re-adding something removed earlier
+    db.flush()
+
+    queue.enqueue(
+        db,
+        kind="parse_source",
+        episode_id=episode.id,
+        user_id=user_id,
+        payload={"source_id": str(source.id)},
+        idempotency_key=f"parse:{source.id}:{digest}",
+    )
+    return source
+
+
+@router.post("/episodes/{episode_id}/sources", response_model=SourceOut, status_code=201)
+def add_source(
+    episode_id: uuid.UUID,
+    body: AddSourceRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> SourceOut:
+    from scripto.adapters import canonicalize_url, classify_url
+    from scripto.pipeline.discover import attach_source
+
+    episode = _owned_episode(episode_id, db, user)
+    _check_source_allowance(db, episode)
+
+    if body.text:
+        source = _attach_in_hand_source(
             db,
-            kind="parse_source",
-            episode_id=episode.id,
+            episode=episode,
             user_id=user.id,
-            payload={"source_id": str(existing.id)},
-            idempotency_key=f"parse:{existing.id}:{digest}",
+            raw=body.text.encode(),
+            source_type="user_pasted",
+            title=body.title,
         )
-        source, added_by = existing, "user"
+        added_by = "user"
     elif body.url:
+        # A doomed fetch tells the host nothing, so say what to do instead.
+        if _is_linkedin_profile(body.url):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, LINKEDIN_PROFILE_HINT)
         source = attach_source(
             db,
             episode=episode,
@@ -377,6 +445,67 @@ def add_source(
         status=source.status,
         error=source.error,
         added_by=added_by,
+    )
+
+
+@router.post("/episodes/{episode_id}/sources/upload", response_model=SourceOut, status_code=201)
+async def upload_source(
+    episode_id: uuid.UUID,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+) -> SourceOut:
+    """Upload a resume, bio, transcript or briefing note.
+
+    The remedy for a guest with little material online, and the way a LinkedIn
+    profile gets in: profiles cannot be fetched, but their "Save to PDF" export
+    can be uploaded. The file becomes an ordinary source, cited like any other.
+    """
+    episode = _owned_episode(episode_id, db, user)
+    _check_source_allowance(db, episode)
+
+    name = (file.filename or "").strip()
+    suffix = PurePosixPath(name).suffix.lower()
+    source_type = UPLOAD_TYPES.get(suffix)
+    if source_type is None:
+        raise HTTPException(
+            415,
+            f"cannot read {suffix or 'that file'}. Upload a PDF, a Word document "
+            "(.docx), or a .txt or .md file.",
+        )
+
+    raw = await file.read()
+    if not raw.strip():
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "the file was empty")
+    if len(raw) > settings.max_upload_bytes:
+        limit = settings.max_upload_bytes // (1024 * 1024)
+        raise HTTPException(413, f"the file is larger than the {limit} MB limit")
+
+    source = _attach_in_hand_source(
+        db, episode=episode, user_id=user.id, raw=raw, source_type=source_type, title=name or None
+    )
+
+    # New material can change the coverage verdict, so re-score.
+    queue.enqueue(
+        db,
+        kind="coverage_check",
+        episode_id=episode.id,
+        user_id=user.id,
+        payload={},
+        delay_seconds=10,
+    )
+    db.commit()
+
+    return SourceOut(
+        id=source.id,
+        type=source.type,
+        url=source.url,
+        title=source.title,
+        author=source.author,
+        published_at=source.published_at,
+        status=source.status,
+        error=source.error,
+        added_by="user",
     )
 
 

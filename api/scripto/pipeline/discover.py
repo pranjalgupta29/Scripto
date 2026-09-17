@@ -11,7 +11,8 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from scripto.adapters import canonicalize_url, classify_url
+from scripto.adapters import FetchError, canonicalize_url, classify_url
+from scripto.adapters.youtube import video_id
 from scripto.config import settings
 from scripto.jobs import queue
 from scripto.jobs.limits import BudgetExceeded, SlotUnavailable, provider_slot
@@ -35,6 +36,20 @@ def query_patterns(entity: Entity) -> list[str]:
         # Public company guests: filings and earnings call mentions.
         patterns.append(f'"{name}" {employer} earnings call OR 10-K OR filing')
     return patterns
+
+
+def is_readable(url: str) -> bool:
+    """YouTube channel and user pages carry no transcript to read.
+
+    A real run spent 6 of its 8 source slots on `youtube.com/@name` pages, every
+    one of which failed, leaving the episode with a single usable source.
+    """
+    if classify_url(url) != "youtube":
+        return True
+    try:
+        return video_id(url) is not None
+    except FetchError:
+        return False  # no video id: a channel, a playlist or a search page
 
 
 def attach_source(
@@ -166,6 +181,8 @@ def run_discover(db: Session, job: Job) -> None:
                 if not canonical or canonical in seen:
                     continue
                 seen.add(canonical)
+                if not is_readable(canonical):
+                    continue  # spends a slot on a page that can never be read
                 source = attach_source(
                     db,
                     episode=episode,

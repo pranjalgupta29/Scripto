@@ -84,6 +84,9 @@ match and discards any claim whose quote cannot be found, so an approximate quot
 costs you the claim.
 - Only claims about the named subject. A passage mentioning several people yields \
 claims only about the subject.
+- Many people share a name. If the passage is about someone else who happens to have \
+the subject's name, return no claims at all. Employer, field of work, pronouns and \
+location are the tells; a matching name is not enough.
 - Do not infer, summarise across sentences, or add outside knowledge."""
 
 EXTRACT_SCHEMA: dict[str, Any] = {
@@ -122,13 +125,71 @@ EXTRACT_SCHEMA: dict[str, Any] = {
 }
 
 
-def extract_prompt(subject: str, chunk_text: str) -> str:
+def extract_prompt(subject: str, chunk_text: str, identity: str | None = None) -> str:
+    """`identity` says *which* person the subject is, so a same-name page yields
+    nothing. Without it a Times Now journalist's interests became a JPMorgan
+    engineer's, and a question was written about his theatre background."""
+    who = f"Who that is: {identity}\n" if identity else ""
     return (
-        f"Subject: {subject}\n\n"
+        f"Subject: {subject}\n{who}\n"
         "Extract claims about the subject from the passage below. For each claim, "
         "copy the exact supporting text into `quote`.\n\n"
         f"<CHUNK>\n{chunk_text}\n</CHUNK>"
     )
+
+
+# --------------------------------------------------------------------------
+# identity gate: is this page about the person we confirmed?
+# --------------------------------------------------------------------------
+
+IDENTITY_CHECK_SYSTEM = """You decide whether a web page is about one specific person.
+
+Many people share a name. You are told who the subject is -- their role, employer and \
+known links -- and given the opening of a page that mentions that name.
+
+Say no when the page is about someone with the same name but a different job, \
+employer, field or life. Say yes when the page is consistent with the subject, and \
+also when the page carries no signal either way: extraction judges each passage after \
+you, so only a real contradiction should stop it."""
+
+IDENTITY_CHECK_SCHEMA: dict[str, Any] = {
+    "title": "check_identity",
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["same_person", "why"],
+    "properties": {
+        "same_person": {"type": "boolean"},
+        "why": {"type": "string"},
+    },
+}
+
+
+def identity_check_prompt(
+    *,
+    subject: str,
+    headline: str | None,
+    employer: str | None,
+    known_urls: list[str],
+    title: str | None,
+    url: str | None,
+    excerpt: str,
+) -> str:
+    lines = [f"Subject: {subject}"]
+    if headline:
+        lines.append(f"Role: {headline}")
+    if employer:
+        lines.append(f"Employer: {employer}")
+    if known_urls:
+        lines.append(f"Known links: {', '.join(known_urls[:3])}")
+    lines += [
+        "",
+        f"Page title: {title or '(none)'}",
+        f"Page URL: {url or '(none)'}",
+        "",
+        "Page opening:",
+        excerpt,
+    ]
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------
@@ -477,6 +538,89 @@ def voice_prompt(transcript: str) -> str:
 # --------------------------------------------------------------------------
 # topic suggestions
 # --------------------------------------------------------------------------
+
+PREP_QUESTIONS_SYSTEM = """You write the short questionnaire a podcast host sends a \
+guest before recording. The guest is a busy person doing the host a favour, so the \
+questionnaire must feel worth their time.
+
+Rules:
+- Ask what the host cannot find out by research. Never ask something the research \
+already answers.
+- Where the research gives you something specific, use it: a question that shows you \
+did your homework earns a better answer than a generic one. Cite the claim ids such \
+a question rests on.
+- Questions that simply suit the format are fine; give those an empty claim_ids list.
+- Write questions the guest can answer in a few sentences. No compound questions, no \
+interrogation, nothing that reads like a form.
+- A question may refer only to what the cited claims literally say. Do not infer a \
+background, a motive or a history the claims do not state: asking someone about a \
+career they never had is worse than asking nothing.
+- Address the guest directly as "you"."""
+
+PREP_QUESTIONS_SCHEMA: dict[str, Any] = {
+    "title": "suggest_prep_questions",
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["questions"],
+    "properties": {
+        "questions": {
+            "type": "array",
+            "maxItems": 8,
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["text", "why", "claim_ids"],
+                "properties": {
+                    "text": {"type": "string"},
+                    "why": {"type": "string"},
+                    "claim_ids": {"type": "array", "items": {"type": "string"}},
+                },
+            },
+        }
+    },
+}
+
+# What each kind of show wants to know before it starts.
+PREP_STYLE_BRIEFS = {
+    "conversational": "Warm and personal. Passions, formative moments, what they are "
+    "excited about right now, and anything they have been wanting to talk about.",
+    "formal": "Professional and precise. Decisions they owned, evidence behind their "
+    "positions, and the parts of their work that are easy to get wrong.",
+    "contrarian": "Invites disagreement. Where they think the consensus is wrong, what "
+    "they would defend under pressure, and criticism they think is fair.",
+    "educational": "Explanatory. What listeners most often misunderstand, what they "
+    "would teach first, and the example they always reach for.",
+}
+
+
+def prep_questions_prompt(
+    *,
+    episode_title: str,
+    subject: str,
+    headline: str | None,
+    style: str,
+    existing_topics: list[str],
+    dossier_lines: list[str],
+) -> str:
+    lines = [
+        f"Episode title: {episode_title}",
+        f"Guest: {subject}" + (f" -- {headline}" if headline else ""),
+        f"Kind of show: {style}. {PREP_STYLE_BRIEFS.get(style, '')}",
+    ]
+    if existing_topics:
+        lines += ["", "Topics the host already plans to cover:"]
+        lines += [f"- {t}" for t in existing_topics]
+    if dossier_lines:
+        lines += ["", "What the research already knows (claim id in brackets):"]
+        lines += dossier_lines
+    else:
+        lines += ["", "There is no research yet. Ask what would help most from scratch."]
+    lines += [
+        "",
+        "Write up to 6 questions for the guest, each citing any claim ids it rests on.",
+    ]
+    return "\n".join(lines)
+
 
 SUGGEST_SYSTEM = """You suggest interview topics for a podcast episode. The episode \
 title sets the theme; the research findings say what this guest can speak to.

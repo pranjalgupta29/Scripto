@@ -49,6 +49,48 @@ class PdfAdapter(SourceAdapter):
         )
 
 
+class DocxAdapter(SourceAdapter):
+    """A Word document the host uploaded: a resume, a bio, a briefing note.
+
+    Like pasted text, it arrives with its content, so there is nothing to fetch.
+    """
+
+    type = "docx"
+
+    def fetch(self, url: str) -> bytes:
+        raise FetchError("docx sources are uploaded with their content, never fetched")
+
+    def parse(self, raw: bytes, *, url: str | None = None) -> ParsedSource:
+        import docx
+
+        try:
+            document = docx.Document(io.BytesIO(raw))
+        except Exception as exc:
+            raise FetchError(f"docx parse failed: {exc}") from exc
+
+        blocks = [p.text.strip() for p in document.paragraphs if p.text.strip()]
+        # Resumes keep dates, employers and skills in tables, which the
+        # paragraph list alone would miss entirely.
+        for table in document.tables:
+            for row in table.rows:
+                cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                if cells:
+                    blocks.append(" | ".join(cells))
+
+        text = "\n\n".join(blocks)
+        if not text:
+            raise FetchError("docx contained no extractable text")
+
+        core = document.core_properties
+        return ParsedSource(
+            title=(core.title or None) or (blocks[0][:200] if blocks else None),
+            author=core.author or None,
+            published_at=None,
+            text=text,
+            segments=None,
+        )
+
+
 class UserPastedAdapter(SourceAdapter):
     """Text the user pasted directly. Already in hand, so fetch is a no-op.
 

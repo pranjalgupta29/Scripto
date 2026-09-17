@@ -22,6 +22,7 @@ dependencies = [
     "selectolax>=0.3.27",
     "trafilatura>=2.0",
     "pypdf>=5.1",
+    "python-docx>=1.1",
     "youtube-transcript-api>=0.6.3",
     "tiktoken>=0.8",
     "numpy>=2.1",

@@ -234,6 +234,56 @@ class FakeProvider(LLMProvider):
         )
         return {"suggestions": suggestions}
 
+    def _task_check_identity(self, prompt: str) -> dict[str, Any]:
+        """Mismatch when the page names an employer other than the subject's.
+
+        A crude proxy for what a real model weighs, but deterministic, and it
+        catches the case that caused this gate: a same-name journalist's page
+        attributed to an engineer.
+        """
+        employer = (_extract_field(prompt, "Employer") or "").strip()
+        # Only the page itself. The prompt's own "Role: Analyst at X" line would
+        # otherwise match the subject's employer every time.
+        opening = prompt.split("Page opening:", 1)[-1]
+        named = re.findall(r"\bat ([A-Z][\w&.\-' ]{2,40})", opening)
+        if not employer or not named:
+            return {"same_person": True, "why": "nothing contradicts the subject"}
+
+        matches = any(
+            employer.lower() in found.lower() or found.lower() in employer.lower()
+            for found in named
+        )
+        return {
+            "same_person": matches,
+            "why": (
+                f"the page names {named[0].strip()}, not {employer}"
+                if not matches
+                else f"the page names {employer}"
+            ),
+        }
+
+    def _task_suggest_prep_questions(self, prompt: str) -> dict[str, Any]:
+        """Questions grounded in the research, plus one that suits the format."""
+        pairs = re.findall(
+            r"^\[([0-9a-f-]{36})\](?:\s*\([^)]*\))?\s*(.+)$", prompt, re.MULTILINE
+        )
+        questions = [
+            {
+                "text": f"Can you tell us more about: {text.strip()[:60]}?",
+                "why": "Grounded in the research.",
+                "claim_ids": [claim_id],
+            }
+            for claim_id, text in pairs[:3]
+        ]
+        questions.append(
+            {
+                "text": "What are you most excited about right now?",
+                "why": "Suits the format; not researched.",
+                "claim_ids": [],
+            }
+        )
+        return {"questions": questions}
+
     def _task_voice_descriptors(self, prompt: str) -> dict[str, Any]:
         return {
             "descriptors": {
