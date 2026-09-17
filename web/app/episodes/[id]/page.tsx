@@ -353,14 +353,16 @@ function SourcesPanel({
 
       {error ? <p className="mt-3 text-sm text-red-700">{error}</p> : null}
 
-      <div className="mt-4 grid gap-3 sm:grid-cols-2">
+      {/* items-start: without it the grid stretches both columns to the taller
+          row, inflating the URL field and its button to the textarea's height. */}
+      <div className="mt-4 grid items-start gap-3 sm:grid-cols-2">
         <form
           onSubmit={(e) => {
             e.preventDefault();
             setError(null);
             addUrl.mutate();
           }}
-          className="flex gap-2"
+          className="flex items-start gap-2"
         >
           <Input
             placeholder="Add a URL"
@@ -1051,6 +1053,13 @@ function ScriptPanel({
   const backups = segments.filter((s) => s.segment_type === "bonus");
   const hasEdits = segments.some((s) => s.edited_by_user);
 
+  // The POST returns 202 and the writing happens in a job, so isPending covers
+  // only the request. A script row exists before its segments do -- that gap is
+  // the work. Without this the sole signal was the progress card at the top of
+  // the page, so a host who did not scroll up could not tell it had started.
+  const generating =
+    generate.isPending || (!!script.data && segments.length === 0);
+
   return (
     <Card>
       <div className="flex items-center justify-between">
@@ -1157,17 +1166,17 @@ function ScriptPanel({
               setError(null);
               generate.mutate();
             }}
-            disabled={generate.isPending}
+            disabled={generating}
           >
-            {generate.isPending
-              ? "Generating…"
-              : !segments.length
-                ? "Generate script"
-                : feedback.trim()
-                  ? "Regenerate with these changes"
-                  : "Regenerate script"}
+            {generating
+              ? "Writing…"
+              : feedback.trim()
+                ? "Regenerate with these changes"
+                : segments.length
+                  ? "Regenerate script"
+                  : "Generate script"}
           </Button>
-          {segments.length ? (
+          {segments.length && !generating ? (
             <span className="text-xs text-black/50">
               {feedback.trim()
                 ? "Your note goes to the writer with the current version, so it revises rather than starting over."
@@ -1177,6 +1186,16 @@ function ScriptPanel({
             </span>
           ) : null}
         </div>
+        {generating ? (
+          <p className="flex items-center gap-2 rounded border border-black/10 bg-black/[0.03] px-3 py-2 text-xs text-black/65">
+            <span
+              aria-hidden
+              className="h-3 w-3 shrink-0 animate-spin rounded-full border-2 border-black/15 border-t-black/50"
+            />
+            Writing your run-of-show. This usually takes a minute or two — it
+            appears here when it is ready, and you can keep working meanwhile.
+          </p>
+        ) : null}
         {error ? <p className="text-sm text-red-700">{error}</p> : null}
       </div>
 
