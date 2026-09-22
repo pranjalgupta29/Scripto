@@ -1,10 +1,11 @@
 "use client";
 
 import { useMutation, useQuery } from "@tanstack/react-query";
+import { Upload } from "lucide-react";
 import { useState } from "react";
 
 import { ApiError, api } from "@/lib/api";
-import { Button, Card, Textarea } from "@/components/ui";
+import { Badge, Button, Card, Textarea } from "@/components/ui";
 
 /**
  * The guest's page. No account, no sign-in, and none of the host's research is
@@ -76,8 +77,10 @@ export default function PrepPage({ params }: { params: { token: string } }) {
     return (
       <div className="mx-auto max-w-xl">
         <Card>
-          <h1 className="text-lg font-semibold">This link is not active</h1>
-          <p className="mt-2 text-sm text-black/60">
+          <h1 className="font-serif text-heading font-semibold text-ink">
+            This link is not active
+          </h1>
+          <p className="mt-2 text-body text-ink-muted">
             It may have been revoked, or the address may be incomplete. Ask your
             host for a new one.
           </p>
@@ -91,22 +94,24 @@ export default function PrepPage({ params }: { params: { token: string } }) {
 
   return (
     <div className="mx-auto max-w-xl">
-      <h1 className="text-2xl font-semibold tracking-tight">
+      <h1 className="font-serif text-display font-semibold text-ink">
         Before we record — what would you like to talk about?
       </h1>
-      <p className="mt-2 text-sm text-black/60">
+      <p className="mt-2 text-body text-ink-muted">
         You are a guest on{" "}
-        <span className="font-medium">{data.episode_title}</span>. These are here
+        <span className="font-medium text-ink">{data.episode_title}</span>. These are here
         to shape the conversation, not to preview it — your host will bring their
         own questions on the day. Answer what you like, skip what you do not.
       </p>
 
       {sent ? (
-        <p className="mt-4 rounded border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-900">
-          Thank you — that reached your host. You can keep adding more below.
-        </p>
+        <div className="mt-4">
+          <Badge tone="success" className="px-3 py-2 text-body">
+            Thank you — that reached your host. You can keep adding more below.
+          </Badge>
+        </div>
       ) : null}
-      {error ? <p className="mt-4 text-sm text-red-700">{error}</p> : null}
+      {error ? <p className="mt-4 text-body text-status-danger">{error}</p> : null}
 
       {questions.length ? (
         <Card className="mt-6">
@@ -120,9 +125,10 @@ export default function PrepPage({ params }: { params: { token: string } }) {
           >
             {questions.map((question, index) => (
               <label key={index} className="block">
-                <span className="text-sm">{question.text}</span>
+                <span className="text-body text-ink">{question.text}</span>
                 <Textarea
                   rows={3}
+                  className="mt-1"
                   value={answers[index] ?? ""}
                   onChange={(e) =>
                     setAnswers({ ...answers, [index]: e.target.value })
@@ -141,13 +147,13 @@ export default function PrepPage({ params }: { params: { token: string } }) {
       ) : null}
 
       <Card className="mt-4">
-        <h2 className="text-sm font-semibold">Attach a file</h2>
-        <p className="mt-1 text-xs text-black/50">
+        <h2 className="text-heading font-semibold text-ink">Attach a file</h2>
+        <p className="mt-1 text-caption text-ink-subtle">
           A CV, a bio, a talk transcript. PDF, Word, .txt or .md. If your
           LinkedIn profile is the best summary, open it, choose More → Save to
           PDF, and send that.
         </p>
-        <label className="mt-3 flex cursor-pointer items-center justify-center rounded border border-dashed border-black/20 px-3 py-4 text-center text-sm text-black/55 hover:border-black/40">
+        <label className="mt-3 flex cursor-pointer items-center justify-center gap-2 rounded border border-dashed border-line px-3 py-4 text-center text-body text-ink-muted transition hover:border-line-strong">
           <input
             type="file"
             accept=".pdf,.docx,.txt,.md"
@@ -161,12 +167,13 @@ export default function PrepPage({ params }: { params: { token: string } }) {
               upload.mutate(file);
             }}
           />
+          <Upload size={15} className="shrink-0" />
           {upload.isPending ? "Sending…" : "Choose a file"}
         </label>
       </Card>
 
       <Card className="mt-4">
-        <h2 className="text-sm font-semibold">Anything else</h2>
+        <h2 className="text-heading font-semibold text-ink">Anything else</h2>
         <form
           className="mt-3 space-y-4"
           onSubmit={(e) => {
@@ -176,21 +183,23 @@ export default function PrepPage({ params }: { params: { token: string } }) {
           }}
         >
           <label className="block">
-            <span className="text-xs font-medium text-black/60">
+            <span className="text-caption font-medium text-ink-muted">
               Something they did not ask about, or would rather you avoided
             </span>
             <Textarea
               rows={3}
+              className="mt-1"
               value={extra}
               onChange={(e) => setExtra(e.target.value)}
             />
           </label>
           <label className="block">
-            <span className="text-xs font-medium text-black/60">
+            <span className="text-caption font-medium text-ink-muted">
               Links worth reading — past interviews, essays, talks (one per line)
             </span>
             <Textarea
               rows={3}
+              className="mt-1"
               value={links}
               onChange={(e) => setLinks(e.target.value)}
             />

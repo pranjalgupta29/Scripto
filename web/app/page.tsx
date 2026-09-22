@@ -6,7 +6,7 @@ import { useEffect, useState } from "react";
 
 import { ApiError, api, getToken, setToken } from "@/lib/api";
 import type { Episode } from "@/lib/types";
-import { Button, Card, Input } from "@/components/ui";
+import { Badge, Button, Card, EmptyState, FOCUS_RING, Input, Skeleton } from "@/components/ui";
 
 export default function HomePage() {
   const [authed, setAuthed] = useState<boolean | null>(null);
@@ -41,10 +41,10 @@ function AuthPanel({ onAuthed }: { onAuthed: () => void }) {
 
   return (
     <div className="mx-auto max-w-md">
-      <h1 className="text-2xl font-semibold tracking-tight">
+      <h1 className="font-serif text-display font-semibold text-ink">
         Research your next guest
       </h1>
-      <p className="mt-2 text-sm text-black/60">
+      <p className="mt-2 text-body text-ink-muted">
         Every line in the dossier and the script links back to a source you can open.
       </p>
 
@@ -72,8 +72,8 @@ function AuthPanel({ onAuthed }: { onAuthed: () => void }) {
             value={password}
             onChange={(e) => setPassword(e.target.value)}
           />
-          {error ? <p className="text-sm text-red-700">{error}</p> : null}
-          <Button type="submit" disabled={submit.isPending} className="w-full">
+          {error ? <p className="text-body text-status-danger">{error}</p> : null}
+          <Button type="submit" disabled={submit.isPending} className="w-full justify-center">
             {submit.isPending
               ? "…"
               : mode === "signup"
@@ -86,7 +86,7 @@ function AuthPanel({ onAuthed }: { onAuthed: () => void }) {
             setMode(mode === "signup" ? "login" : "signup");
             setError(null);
           }}
-          className="mt-3 w-full text-xs text-black/50 hover:text-black"
+          className={`mt-3 w-full rounded text-caption text-ink-subtle hover:text-ink ${FOCUS_RING}`}
         >
           {mode === "signup"
             ? "Already have an account? Sign in"
@@ -129,8 +129,8 @@ function EpisodeList({ onSignOut }: { onSignOut: () => void }) {
     <div className="space-y-8">
       <div className="flex items-start justify-between">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight">Episodes</h1>
-          <p className="mt-1 text-sm text-black/60">
+          <h1 className="font-serif text-display font-semibold text-ink">Episodes</h1>
+          <p className="mt-1 text-body text-ink-muted">
             One episode, one guest, one script.
           </p>
         </div>
@@ -146,7 +146,7 @@ function EpisodeList({ onSignOut }: { onSignOut: () => void }) {
       </div>
 
       <Card>
-        <h2 className="text-sm font-semibold">New episode</h2>
+        <h2 className="text-heading font-semibold text-ink">New episode</h2>
         <form
           onSubmit={(e) => {
             e.preventDefault();
@@ -176,11 +176,11 @@ function EpisodeList({ onSignOut }: { onSignOut: () => void }) {
               onChange={(e) => setDisambiguator(e.target.value)}
             />
           </div>
-          <p className="text-xs text-black/50">
+          <p className="text-caption text-ink-subtle">
             A disambiguator is required — a name alone identifies the wrong person
             often enough to poison the whole dossier.
           </p>
-          {error ? <p className="text-sm text-red-700">{error}</p> : null}
+          {error ? <p className="text-body text-status-danger">{error}</p> : null}
           <Button type="submit" disabled={create.isPending}>
             {create.isPending ? "Creating…" : "Create episode"}
           </Button>
@@ -189,33 +189,39 @@ function EpisodeList({ onSignOut }: { onSignOut: () => void }) {
 
       <div className="space-y-2">
         {episodes.isLoading ? (
-          <p className="text-sm text-black/50">Loading…</p>
+          <div className="space-y-2">
+            <Skeleton className="h-16 w-full" />
+            <Skeleton className="h-16 w-full" />
+          </div>
         ) : episodes.data?.length ? (
           episodes.data.map((episode) => (
-            <button
+            <Card
               key={episode.id}
+              as="button"
+              variant="interactive"
               onClick={() => router.push(`/episodes/${episode.id}`)}
-              className="flex w-full items-center justify-between rounded-lg border border-black/10 bg-white px-5 py-4 text-left transition hover:border-black/25"
+              className="flex w-full items-center justify-between gap-3 px-5 py-4"
             >
-              <div>
-                <p className="font-medium">{episode.title}</p>
-                <p className="text-sm text-black/55">
+              <div className="min-w-0">
+                <p className="truncate font-medium text-ink">{episode.title}</p>
+                <p className="truncate text-body text-ink-muted">
                   {episode.guest?.name ?? episode.guest_name}
                   {episode.guest?.employer ? ` · ${episode.guest.employer}` : ""}
                 </p>
               </div>
-              <div className="text-right">
-                <span className="text-xs text-black/50">{episode.status}</span>
+              <div className="flex shrink-0 flex-col items-end gap-1">
+                <Badge tone="neutral">{episode.status}</Badge>
                 {episode.coverage_mode && episode.coverage_mode !== "rich" ? (
-                  <p className="text-xs text-amber-700">
-                    {episode.coverage_mode} coverage
-                  </p>
+                  <Badge tone="warning">{episode.coverage_mode} coverage</Badge>
                 ) : null}
               </div>
-            </button>
+            </Card>
           ))
         ) : (
-          <p className="text-sm text-black/50">No episodes yet.</p>
+          <EmptyState
+            title="No episodes yet."
+            hint="Create your first one above to start researching a guest."
+          />
         )}
       </div>
     </div>
